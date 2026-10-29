@@ -1,0 +1,8 @@
+id: case_001
+category: security
+description: SQL 注入 - f-string 拼接用户输入进查询语句
+snippet: snippets/case_001.py
+ground_truth:
+  line_range: [9, 10]
+  severity: major
+  keywords: ["sql", "execute", "注入"]

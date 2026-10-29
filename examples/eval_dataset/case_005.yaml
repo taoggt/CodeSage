@@ -1,0 +1,8 @@
+id: case_005
+category: security
+description: 命令注入 - subprocess 使用 shell=True 且拼接用户输入
+snippet: snippets/case_005.py
+ground_truth:
+  line_range: [7, 8]
+  severity: critical
+  keywords: ["shell", "subprocess", "注入"]

@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# 虚拟环境
+.venv/
+venv/
+
+# 工具缓存
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# CodeSage 运行产物（历史记录 / 错题本 / 评测结果）
+.codesage/
+.codesage-eval/
+
+# 环境与密钥
+.env
+
+# IDE
+.idea/
+.vscode/

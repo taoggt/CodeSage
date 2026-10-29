@@ -1,0 +1,31 @@
+# ============================================================
+# CodeSage 项目配置模板
+# 复制为 codesage.toml 放在运行目录即可生效（也可以全部用环境变量覆盖）
+# 优先级：环境变量 > codesage.toml > 代码默认值
+# ============================================================
+
+[llm]
+# API Key 建议放 .env，不要写进这里提交到 git
+base_url = "https://api.deepseek.com"
+model_strong = "deepseek-chat"     # 深度审查使用的模型
+model_fast = "deepseek-chat"       # 工具决策 / 摘要压缩使用的模型
+temperature = 0.2
+max_output_tokens = 4096
+timeout = 120.0
+
+[budget]
+context_window = 64000        # 模型上下文窗口（token）
+soft_ratio = 0.6              # 使用率 ≥ 60%：回合边界触发压缩
+hard_ratio = 0.8              # 使用率 ≥ 80%：调用前强制压缩
+abort_ratio = 0.95            # 使用率 ≥ 95%：熔断，输出已有发现
+input_price_per_m = 2.0       # 输入单价（元 / 百万 token），用于成本估算
+output_price_per_m = 8.0      # 输出单价（元 / 百万 token）
+
+[review]
+max_turns = 12                # ReAct 循环最大轮次
+active_window_turns = 4       # 记忆活跃区保留的最近轮数
+max_file_lines = 2000         # 超过则跳过（大文件预过滤）
+max_chunk_lines = 400         # 单块最大行数
+tool_output_limit = 500       # 工具单次输出最大行数
+max_candidates_in_prompt = 40 # 注入初始上下文的候选发现上限
+# store_path = ""             # 历史/错题本存储；留空 = 用户级默认 ~/.codesage/store.db

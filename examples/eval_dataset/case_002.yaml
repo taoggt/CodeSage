@@ -1,0 +1,8 @@
+id: case_002
+category: bug
+description: 资源泄漏 - open 未用 with 且异常路径不关闭；可变默认参数
+snippet: snippets/case_002.py
+ground_truth:
+  line_range: [5, 14]
+  severity: major
+  keywords: ["with", "默认参数", "close"]
