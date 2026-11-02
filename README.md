@@ -135,12 +135,6 @@ codesage history --feedback      # 附带反馈统计
 
 选择工作区有三种方式（不需要手抄路径）：**系统文件夹对话框**（推荐，直接弹本机选择框）、**网页内目录浏览**（逐层点选，含盘符与常用位置）、**最近打开**；网络盘等特殊场景仍可手动输入。
 
-![工作台](docs/images/gui-workbench.png)
-
-![报告页](docs/images/gui-report.png)
-
-![错题本](docs/images/gui-lessons.png)
-
 **已知限制**（详见 `docs/GUI.md`）：取消是协作式的（在途 LLM 请求需先返回，≤120s）· 必须单进程单 worker · 仅回环地址、无登录 · 评测只有 5 例种子集，"误报率"用 1 − Precision 近似。
 
 ## 项目结构
