@@ -9,6 +9,12 @@
 - 本模块是"组合层"：不放业务算法，只做依赖装配与流程控制；
 - Harness 评测只通过 run_review() 驱动（保证评测走真实链路）；
 - store 落盘失败不致命（只读目录 / 权限问题不应中断审查）。
+
+GUI 支持（2026-11 新增，CLI 行为不变）：
+- options.cancel_token：协作式取消。检查点位于每个阶段边界与逐文件循环内；
+  扫描/静态阶段取消 → 直接返回空报告且不落盘；LLM 阶段取消 → 保留已有发现并落盘；
+- options.persist=False：评测场景不写历史表（避免临时目录污染 reviews）；
+- 新增事件 phase / progress / cancelled / persist_failed，供前端画阶段时间线。
 """
 
 from __future__ import annotations
@@ -23,6 +29,7 @@ from codesage.agent.loop import AgentLoop, LoopConfig
 from codesage.agent.policies import StopPolicy
 from codesage.agent.profiles import build_system_prompt
 from codesage.analyzers import RuleEngine, default_analyzers
+from codesage.core.cancel import CancelToken
 from codesage.core.config import Settings, load_settings
 from codesage.core.models import Finding, ReviewReport, TokenUsage, dedup_findings
 from codesage.ingest.filters import FileFilter
@@ -39,6 +46,8 @@ from codesage.tools import build_default_tools
 
 EventHook = Callable[[str, dict[str, Any]], None]
 
+PHASES: tuple[str, ...] = ("scan", "static", "llm", "merge", "persist")
+
 
 @dataclass
 class ReviewOptions:
@@ -50,6 +59,10 @@ class ReviewOptions:
     quiet: bool = False
     max_turns: int | None = None
     on_event: EventHook | None = None
+    # ---- GUI / 评测相关（默认值保证 CLI 行为不变）
+    cancel_token: CancelToken | None = None
+    persist: bool = True
+    persist_on_cancel: bool = True
 
 
 def run_review(
@@ -61,6 +74,10 @@ def run_review(
     started = time.perf_counter()
     settings = settings or load_settings()
     options = options or ReviewOptions()
+    token = options.cancel_token
+
+    def is_cancelled() -> bool:
+        return token is not None and token.cancelled
 
     target = Path(path).expanduser().resolve()
     if not target.exists():
@@ -68,7 +85,31 @@ def run_review(
 
     workspace = target if target.is_dir() else target.parent
 
+    def cancelled_report(phase: str) -> ReviewReport:
+        """扫描/静态阶段取消：不落盘，返回空报告（调用方据 metadata 判断）。"""
+        report = ReviewReport(
+            target=str(target),
+            findings=[],
+            duration_sec=time.perf_counter() - started,
+            llm_enabled=False,
+            stop_reason=f"用户取消（{phase} 阶段）",
+            metadata={
+                "profile": options.profile,
+                "cost_yuan": 0.0,
+                "cancelled": True,
+                "cancelled_phase": phase,
+                "partial": True,
+            },
+        )
+        _emit(options, "cancelled", {"phase": phase})
+        _emit(options, "done", _done_payload(report, cancelled=True))
+        return report
+
+    if is_cancelled():
+        return cancelled_report("init")
+
     # ---------------------------------------------------------- 1. 扫描
+    _emit(options, "phase", {"name": "scan", "index": 1, "total": len(PHASES)})
     file_filter = FileFilter(
         workspace,
         excludes=list(settings.review.ignore_dirs),
@@ -110,8 +151,11 @@ def run_review(
         )
 
     _emit(options, "scan", {"files": len(files), "skipped": len(scan_result.skipped)})
+    if is_cancelled():
+        return cancelled_report("scan")
 
     # ---------------------------------------------------------- 2. 确定性分析
+    _emit(options, "phase", {"name": "static", "index": 2, "total": len(PHASES)})
     det_findings: list[Finding] = []
     engine = RuleEngine()
     analyzers = [a for a in default_analyzers() if a.is_available()]
@@ -120,6 +164,8 @@ def run_review(
     # 一次读取全部源码（多处复用）
     sources: list[tuple[str, str]] = []  # (相对路径, 源码)
     for file_path in files:
+        if is_cancelled():
+            return cancelled_report("static")
         try:
             source = file_path.read_text(encoding="utf-8", errors="replace")
         except OSError:
@@ -129,12 +175,23 @@ def run_review(
         sources.append((rel, source))
 
     # 自研规则引擎（零 Token，逐文件遍历）
-    for rel, source in sources:
+    total_sources = max(1, len(sources))
+    for index, (rel, source) in enumerate(sources, start=1):
+        if is_cancelled():
+            return cancelled_report("static")
         det_findings.extend(engine.run(rel, source))
+        if index % 20 == 0 or index == total_sources:
+            _emit(
+                options,
+                "progress",
+                {"phase": "static", "done": index, "total": total_sources},
+            )
 
     # 外部分析器：支持批量的走单次子进程调用（大仓库性能关键路径）
     # 传入 base_dir 让分析器直接扫描真实目录（避免临时目录的写删开销）
     for analyzer in analyzers:
+        if is_cancelled():
+            return cancelled_report("static")
         if getattr(analyzer, "supports_batch", False):
             batch = analyzer.run_batch(sources, base_dir=workspace)
             for findings in batch.values():
@@ -150,6 +207,7 @@ def run_review(
     )
 
     # ---------------------------------------------------------- 3. Agent 循环
+    _emit(options, "phase", {"name": "llm", "index": 3, "total": len(PHASES)})
     llm_findings: list[Finding] = []
     dismissed: list[dict] = []
     loop_usage = TokenUsage()
@@ -157,102 +215,99 @@ def run_review(
     stop_reason = ""
     compress_events = 0
     llm_used = False
+    cancelled_reason: str | None = None
 
     store = _open_store(settings.review.store_path)
-    if options.use_llm and settings.llm_configured:
-        llm_used = True
-        client = LLMClient(settings.llm)
-        router = ModelRouter(settings.llm)
-        estimator = get_estimator()
-        budget = TokenBudget(settings.budget)
-        memory = WorkingMemory(active_window_turns=settings.review.active_window_turns)
+    try:
+        if is_cancelled():
+            cancelled_reason = "llm"
+        elif options.use_llm and settings.llm_configured:
+            llm_used = True
+            client = LLMClient(settings.llm)
+            router = ModelRouter(settings.llm)
+            estimator = get_estimator()
+            budget = TokenBudget(settings.budget)
+            memory = WorkingMemory(active_window_turns=settings.review.active_window_turns)
 
-        knowledge_base = default_knowledge_base()
-        registry = build_default_tools(
-            workspace=workspace,
-            analyzers=analyzers,
-            knowledge_base=knowledge_base,
-            findings_collector=llm_findings,
-            dismissed_collector=dismissed,
-            read_limit=settings.review.tool_output_limit,
-        )
+            knowledge_base = default_knowledge_base()
+            registry = build_default_tools(
+                workspace=workspace,
+                analyzers=analyzers,
+                knowledge_base=knowledge_base,
+                findings_collector=llm_findings,
+                dismissed_collector=dismissed,
+                read_limit=settings.review.tool_output_limit,
+            )
 
-        lessons_block = ""
-        if store is not None:
-            try:
-                from codesage.optim.lessons import LessonBook
+            lessons_block = ""
+            if store is not None:
+                try:
+                    from codesage.optim.lessons import LessonBook
 
-                lessons_block = LessonBook(store).few_shot_block(
-                    project=str(workspace)
-                )
-            except Exception:  # noqa: BLE001 - 错题本读取失败不影响审查
-                lessons_block = ""
+                    lessons_block = LessonBook(store).few_shot_block(
+                        project=str(workspace)
+                    )
+                except Exception:  # noqa: BLE001 - 错题本读取失败不影响审查
+                    lessons_block = ""
 
-        system_prompt = build_system_prompt(
-            options.profile,
-            workspace_summary=build_workspace_summary(workspace, files),
-            lessons_block=lessons_block,
-            budget_hint=(
-                f"最多可执行 {settings.review.max_turns} 轮工具调用，请合理分配。"
-            ),
-        )
-        brief = build_task_brief(
-            target=str(target),
-            files=file_inventory,
-            candidates=det_findings,
-            max_candidates=settings.review.max_candidates_in_prompt,
-            changed_only=options.changed_only,
-        )
+            system_prompt = build_system_prompt(
+                options.profile,
+                workspace_summary=build_workspace_summary(workspace, files),
+                lessons_block=lessons_block,
+                budget_hint=(
+                    f"最多可执行 {settings.review.max_turns} 轮工具调用，请合理分配。"
+                ),
+            )
+            brief = build_task_brief(
+                target=str(target),
+                files=file_inventory,
+                candidates=det_findings,
+                max_candidates=settings.review.max_candidates_in_prompt,
+                changed_only=options.changed_only,
+            )
 
-        compressor = _make_compressor(client, router, budget)
-        loop = AgentLoop(
-            client=client,
-            registry=registry,
-            memory=memory,
-            budget=budget,
-            estimator=estimator,
-            model=router.model_for(TaskKind.REVIEW),
-            policy=StopPolicy(
-                max_turns=options.max_turns or settings.review.max_turns
-            ),
-            config=LoopConfig(
-                max_turns=options.max_turns or settings.review.max_turns,
-            ),
-            compressor=compressor,
-            findings_counter=lambda: len(llm_findings),
-            on_event=options.on_event,
-        )
+            compressor = _make_compressor(client, router, budget)
+            loop = AgentLoop(
+                client=client,
+                registry=registry,
+                memory=memory,
+                budget=budget,
+                estimator=estimator,
+                model=router.model_for(TaskKind.REVIEW),
+                policy=StopPolicy(
+                    max_turns=options.max_turns or settings.review.max_turns
+                ),
+                config=LoopConfig(
+                    max_turns=options.max_turns or settings.review.max_turns,
+                ),
+                compressor=compressor,
+                findings_counter=lambda: len(llm_findings),
+                on_event=options.on_event,
+                cancel_token=token,
+            )
 
-        result = loop.run(
-            [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": brief},
-            ]
-        )
-        loop_usage = result.usage
-        turns = result.turns
-        stop_reason = result.stop_reason
-        compress_events = result.compress_events
+            result = loop.run(
+                [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": brief},
+                ]
+            )
+            loop_usage = result.usage
+            turns = result.turns
+            stop_reason = result.stop_reason
+            compress_events = result.compress_events
+            if result.status == "cancelled":
+                cancelled_reason = "llm"
 
-    elif options.use_llm:
-        stop_reason = "未配置 API Key，已降级为确定性分析"
+        elif options.use_llm:
+            stop_reason = "未配置 API Key，已降级为确定性分析"
 
-    # ---------------------------------------------------------- 4. 合并与聚合
-    merged = _merge_findings(det_findings, llm_findings, dismissed)
-    duration = time.perf_counter() - started
+        # ------------------------------------------------------ 4. 合并与聚合
+        _emit(options, "phase", {"name": "merge", "index": 4, "total": len(PHASES)})
+        merged = _merge_findings(det_findings, llm_findings, dismissed)
+        duration = time.perf_counter() - started
 
-    report = ReviewReport(
-        target=str(target),
-        findings=merged,
-        duration_sec=duration,
-        usage=loop_usage,
-        turns=turns,
-        llm_enabled=llm_used,
-        stop_reason=stop_reason,
-        compress_events=compress_events,
-        files_scanned=len(files),
-        files_skipped=len(scan_result.skipped),
-        metadata={
+        metadata: dict[str, Any] = {
             "profile": options.profile,
             "cost_yuan": 0.0,
             "candidates": len(det_findings),
@@ -262,42 +317,84 @@ def run_review(
             "scan_skipped": [
                 {"file": f, "reason": r} for f, r in scan_result.skipped[:20]
             ],
-        },
-    )
+            # 本次实际扫描过的文件（供 GUI 画"哪些文件已审过"的覆盖图，截断到 500）
+            "files": [rel for rel, _ in file_inventory][:500],
+        }
+        if cancelled_reason is not None:
+            metadata.update(
+                {
+                    "cancelled": True,
+                    "cancelled_phase": cancelled_reason,
+                    "partial": True,
+                }
+            )
 
-    # 成本估算（若有 LLM 调用）
-    if llm_used:
-        report.metadata["cost_yuan"] = round(
-            loop_usage.cost_yuan(
-                settings.budget.input_price_per_m,
-                settings.budget.output_price_per_m,
-            ),
-            4,
+        report = ReviewReport(
+            target=str(target),
+            findings=merged,
+            duration_sec=duration,
+            usage=loop_usage,
+            turns=turns,
+            llm_enabled=llm_used,
+            stop_reason=stop_reason or ("用户取消" if cancelled_reason else ""),
+            compress_events=compress_events,
+            files_scanned=len(files),
+            files_skipped=len(scan_result.skipped),
+            metadata=metadata,
         )
 
-    # ---------------------------------------------------------- 5. 落盘
-    if store is not None:
-        try:
-            review_id = store.save_review(report, project=str(workspace))
-            report.metadata["review_id"] = review_id
-        except Exception:  # noqa: BLE001 - 落盘失败不致命
-            pass
-        finally:
+        # 成本估算（若有 LLM 调用）
+        if llm_used:
+            report.metadata["cost_yuan"] = round(
+                loop_usage.cost_yuan(
+                    settings.budget.input_price_per_m,
+                    settings.budget.output_price_per_m,
+                ),
+                4,
+            )
+
+        # ------------------------------------------------------ 5. 落盘
+        should_persist = (
+            options.persist
+            and store is not None
+            and (cancelled_reason is None or options.persist_on_cancel)
+        )
+        if should_persist:
+            _emit(options, "phase", {"name": "persist", "index": 5, "total": len(PHASES)})
+            try:
+                review_id = store.save_review(report, project=str(workspace))
+                report.metadata["review_id"] = review_id
+            except Exception as exc:  # noqa: BLE001 - 落盘失败不致命
+                _emit(options, "persist_failed", {"error": str(exc)})
+    finally:
+        if store is not None:
             store.close()
 
-    _emit(
-        options,
-        "done",
-        {
-            "findings": len(merged),
-            "score": report.score,
-            "duration": round(duration, 2),
-        },
-    )
+    if cancelled_reason is not None:
+        _emit(options, "cancelled", {"phase": cancelled_reason})
+
+    duration = time.perf_counter() - started
+    report.duration_sec = duration
+    _emit(options, "done", _done_payload(report, cancelled=cancelled_reason is not None))
     return report
 
 
 # ---------------------------------------------------------------- 内部工具
+
+
+def _done_payload(report: ReviewReport, cancelled: bool = False) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "findings": len(report.findings),
+        "score": report.score,
+        "duration": round(report.duration_sec, 2),
+    }
+    review_id = report.metadata.get("review_id")
+    if review_id:
+        payload["review_id"] = review_id
+    if cancelled:
+        payload["cancelled"] = True
+        payload["partial"] = True
+    return payload
 
 
 def _merge_findings(

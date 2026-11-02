@@ -24,3 +24,12 @@ venv/
 # IDE
 .idea/
 .vscode/
+.workbuddy/
+
+# 前端（web/ 是源码，产物由 scripts/build_ui.py 生成）
+web/node_modules/
+web/dist/
+web/*.png
+web/*.mjs
+src/codesage/server/static/index.html
+src/codesage/server/static/assets/

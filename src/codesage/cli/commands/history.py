@@ -13,9 +13,11 @@ from rich.console import Console
 from rich.table import Table
 
 from codesage.cli.render import render_report
+from codesage.core.config import load_settings
 from codesage.core.models import ReviewReport
-from codesage.memory.store import Store, default_store_path
 from codesage.optim.feedback import verdict_label
+from codesage.services.history_service import normalize_project as _normalize_project
+from codesage.services.store_factory import open_store, resolve_store_path
 
 console = Console()
 
@@ -26,21 +28,6 @@ def _display_target(target: str) -> str:
         return Path(target).resolve().relative_to(Path.cwd().resolve()).as_posix()
     except (ValueError, OSError):
         return target
-
-
-def _normalize_project(project: Path) -> str:
-    """归一化 --project 参数，与审查写入端的 project 语义保持一致。
-
-    写入端（pipeline）的 project = 审查根目录：单文件审查时取文件所在目录，
-    因此查询端传文件路径时必须同样归一到父目录，否则精确匹配永远失败
-    （真实用户反馈：`history -p test.py` 报"暂无记录"，但记录其实在库里）。
-    判定规则：存在的文件 → 父目录；带后缀的不存在路径（文件已删除）→ 父目录；
-    其余（目录）→ 原样。
-    """
-    resolved = Path(project).resolve()
-    if resolved.is_file() or (not resolved.is_dir() and resolved.suffix):
-        return str(resolved.parent)
-    return str(resolved)
 
 
 def history(
@@ -63,14 +50,13 @@ def history(
       codesage history --project .     # 只看当前项目的记录
       codesage history --feedback      # 附反馈统计
     """
-    db_path = default_store_path()
+    db_path = resolve_store_path(load_settings())
     if not db_path.exists():
         console.print(f"[yellow]暂无历史记录（{db_path} 不存在）[/yellow]")
         console.print("[dim]先运行一次 `codesage review <path>` 生成记录。[/dim]")
         raise typer.Exit(0)
 
-    store = Store(db_path)
-    try:
+    with open_store(load_settings()) as store:
         # ---- 详情模式：展示某次审查的完整发现
         if detail is not None:
             payload = store.get_review_payload(detail)
@@ -126,5 +112,3 @@ def history(
                     console.print(f"  {verdict_label(verdict)}: {count}")
             else:
                 console.print("\n[dim]暂无反馈记录。[/dim]")
-    finally:
-        store.close()

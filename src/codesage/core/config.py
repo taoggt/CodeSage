@@ -64,6 +64,18 @@ class ReviewSettings(BaseModel):
     )
 
 
+class ServerSettings(BaseModel):
+    """浏览器 GUI 配置（仅监听回环地址）。"""
+
+    host: str = "127.0.0.1"
+    port: int = 8787
+    open_browser: bool = True
+    max_review_jobs: int = 2      # 并发审查任务上限（超过直接 429，不排队）
+    max_eval_jobs: int = 1        # 评测任务串行
+    job_ttl_seconds: int = 7200   # 终态任务在内存中的保留时长
+    event_buffer: int = 2000      # 单任务事件环形缓冲大小
+
+
 class Settings(BaseSettings):
     """CodeSage 全局配置。"""
 
@@ -80,6 +92,7 @@ class Settings(BaseSettings):
     llm: LLMSettings = Field(default_factory=LLMSettings)
     budget: BudgetSettings = Field(default_factory=BudgetSettings)
     review: ReviewSettings = Field(default_factory=ReviewSettings)
+    server: ServerSettings = Field(default_factory=ServerSettings)
 
     @classmethod
     def settings_customise_sources(
@@ -96,7 +109,7 @@ class Settings(BaseSettings):
             env_settings,
             dotenv_settings,
         ]
-        toml_path = Path("codesage.toml")
+        toml_path = _TOML_OVERRIDE or Path("codesage.toml")
         if toml_path.exists():
             sources.append(
                 TomlConfigSettingsSource(settings_cls, toml_file=str(toml_path))
@@ -112,13 +125,26 @@ class Settings(BaseSettings):
 # 常见环境变量兜底顺序（用户不必记住 CODESAGE_ 前缀）
 _FALLBACK_API_KEY_ENVS = ("DEEPSEEK_API_KEY", "OPENAI_API_KEY", "DASHSCOPE_API_KEY")
 
+# 显式指定的 toml 路径（GUI / 测试用；None = 按当前工作目录探测）
+_TOML_OVERRIDE: Path | None = None
 
-def load_settings() -> Settings:
+
+def set_config_file(path: Path | str | None) -> None:
+    """指定 codesage.toml 路径，供非 CLI 进程（GUI/服务端）摆脱 CWD 依赖。"""
+    global _TOML_OVERRIDE
+    _TOML_OVERRIDE = Path(path) if path else None
+
+
+def load_settings(config_file: Path | str | None = None) -> Settings:
     """加载配置并做 API Key 兜底。
 
     若 CODESAGE_LLM__API_KEY 未设置，依次尝试常见环境变量，
     降低上手门槛（例如用户已习惯导出 DEEPSEEK_API_KEY）。
+
+    config_file 显式指定时优先使用该 toml 文件（不传则维持 CWD 探测的旧行为）。
     """
+    if config_file is not None:
+        set_config_file(config_file)
     settings = Settings()
     if not settings.llm.api_key:
         for env_name in _FALLBACK_API_KEY_ENVS:

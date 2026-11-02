@@ -1,0 +1,79 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  @apply bg-ink-50 text-ink-800 antialiased;
+  font-size: 13px;
+}
+
+::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* ---------------- CodeMirror：finding 行高亮与 gutter ---------------- */
+.cm-editor {
+  height: 100%;
+}
+.cm-find {
+  background-color: rgba(148, 163, 184, 0.06);
+}
+.cm-sev-critical {
+  background-color: rgba(220, 38, 38, 0.075);
+  box-shadow: inset 3px 0 0 #dc2626;
+}
+.cm-sev-major {
+  background-color: rgba(234, 88, 12, 0.075);
+  box-shadow: inset 3px 0 0 #ea580c;
+}
+.cm-sev-minor {
+  background-color: rgba(217, 119, 6, 0.07);
+  box-shadow: inset 3px 0 0 #d97706;
+}
+.cm-sev-info {
+  background-color: rgba(37, 99, 235, 0.06);
+  box-shadow: inset 3px 0 0 #2563eb;
+}
+.cm-find-active {
+  background-color: rgba(37, 99, 235, 0.16) !important;
+  box-shadow: inset 3px 0 0 #1d4ed8 !important;
+}
+.cm-sevdot {
+  display: block;
+  width: 7px;
+  height: 7px;
+  border-radius: 9999px;
+  margin: 6px 2px;
+}
+.cm-sevdot-critical {
+  background: #dc2626;
+}
+.cm-sevdot-major {
+  background: #ea580c;
+}
+.cm-sevdot-minor {
+  background: #d97706;
+}
+.cm-sevdot-info {
+  background: #2563eb;
+}
+.cm-finding-gutter {
+  width: 11px;
+}

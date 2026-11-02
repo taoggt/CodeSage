@@ -66,34 +66,37 @@ class LessonBook:
         ]
 
     def mine_from_feedback(self) -> dict[str, int]:
-        """从反馈中提炼经验。返回 {"false_positive": n, "false_negative": m}。
+        """从"未提炼"的反馈中提炼经验。返回 {"false_positive": n, "false_negative": m}。
 
-        每条反馈自带 project（记录反馈时所在的项目），提炼时保持项目隔离。
+        project 语义：每条反馈自带 project（记录反馈时所在的项目），提炼时保持项目隔离。
+
+        幂等性（重要）：
+        - 提炼成功后把反馈标记为 mined，重复点击不会重复生成；
+        - 用户删掉某条经验后，不会在下次提炼时被复活——要复活必须显式重置标记
+          （`Store.reset_feedback_mined`）。删除是"这个结论我不想要"，
+          而不是"再学一遍"。
         """
         added = {"false_positive": 0, "false_negative": 0}
-        for fb in self._store.all_feedback(limit=500):
+        processed: list[int] = []
+
+        for fb in self._store.all_feedback(limit=500, only_unmined=True):
             verdict = str(fb.get("verdict", ""))
-            project = str(fb.get("project") or "")
-            if verdict == "wrong":
-                content = (
-                    f"【误报案例】{fb.get('file', '?')} "
-                    f"{fb.get('title', '?')}"
-                    + (f"：{fb.get('note')}" if fb.get("note") else "")
-                )
-                if self.add(
-                    LESSON_FALSE_POSITIVE, content, str(fb.get("category") or ""), project
-                ) > 0:
-                    added["false_positive"] += 1
-            elif verdict == "missed":
-                content = (
-                    f"【漏报案例】{fb.get('file', '?')} "
-                    f"{fb.get('title', '?')}"
-                    + (f"：{fb.get('note')}" if fb.get("note") else "")
-                )
-                if self.add(
-                    LESSON_FALSE_NEGATIVE, content, str(fb.get("category") or ""), project
-                ) > 0:
-                    added["false_negative"] += 1
+            if verdict not in ("wrong", "missed"):
+                continue  # right（确认）不产生经验，也不标记，保留原始反馈
+
+            is_false_positive = verdict == "wrong"
+            kind = LESSON_FALSE_POSITIVE if is_false_positive else LESSON_FALSE_NEGATIVE
+            prefix = "【误报案例】" if is_false_positive else "【漏报案例】"
+            content = f"{prefix}{fb.get('file') or '?'} {fb.get('title') or '?'}"
+            if fb.get("note"):
+                content += f"：{fb['note']}"
+
+            if self.add(kind, content, str(fb.get("category") or ""), str(fb.get("project") or "")) > 0:
+                key = "false_positive" if is_false_positive else "false_negative"
+                added[key] += 1
+            processed.append(int(fb["id"]))
+
+        self._store.mark_feedback_mined(processed)
         return added
 
     def few_shot_block(self, limit: int = 6, project: str | None = None) -> str:

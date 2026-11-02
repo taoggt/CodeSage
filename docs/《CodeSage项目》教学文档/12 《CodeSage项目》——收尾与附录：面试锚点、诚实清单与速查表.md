@@ -25,7 +25,13 @@
 
 | 状态 | 项目 | 说明 |
 |---|---|---|
-| ✅ 完整落地 | 确定性层（13 规则 + 3 分析器）、ReAct 循环、三区记忆 + 三阈值、全局存储 + 历史下钻、评测体系、错题本闭环（含项目隔离）、CLI 四命令 | 均有测试覆盖与真实运行数据 |
+| ✅ 完整落地 | 确定性层（13 规则 + 3 分析器）、ReAct 循环、三区记忆 + 三阈值、全局存储 + 历史下钻、评测体系、错题本闭环（含项目隔离）、CLI 五命令、浏览器 GUI 六页面 | 均有测试覆盖与真实运行数据（156 例） |
+| ✅ 完整落地 | GUI：实时阶段时间线 / 工具流水 / Token 仪表 / 行级 finding 标注 / 错题本注入预览 | 仅监听回环地址；架构与 API 见 `docs/GUI.md` |
+| 🔌 已修复 | 评测污染历史表 | 旧版每个评测案例往 `reviews` 插一条（库里曾留 12 条 `Temp\codesage_eval_*`）；现 `persist=False`，设置页与 `POST /api/reviews/purge` 可清理遗留 |
+| ⏸ 已知限制 | 取消是协作式的 | 在途 LLM 请求（同步 SDK，≤120s）无法打断；job 先置 `cancelling`，返回后立刻终态；部分结果标 `partial` 并落盘 |
+| ⏸ 已知限制 | GUI 必须单进程单 worker | Job / 事件缓冲 / 取消令牌 / 线程池都在进程内存；多 worker 会让「创建任务」与「订阅事件」落到不同进程 |
+| ⏸ 未做 | GUI 无登录、无暗色主题、无 token 级流式输出 | 定位是本地单人工具；流式需把 `LLMClient` 改成 `stream=True` |
+| 📄 口径修正 | 早期文字写「放弃 Web UI，前端投入产出比低」 | 已修正为「CLI 为主 + 本地 GUI 为辅」：公网服务仍不做，但只回环的 GUI 能展示 ReAct 过程与错题本闭环（`docs/PROJECT_PLAN.md` 六节有改口说明） |
 | 🔌 已实现、未接线 | `PromptRegistry.register()`（`optim/prompts.py`） | 注册表与 `prompts` 表已就位、写入幂等；主链路无调用点——评测与 prompt 版本的自动绑定待接（10 篇 10.5） |
 | 🔌 已实现、未接线 | `chunk_source()`（`ingest/chunker.py`） | 有测试覆盖；主链路暂未调用（大文件当前是"2000 行预过滤 + read_file 分段"）（02 篇 2.2） |
 | 🔌 已实现、未接线 | `expand_ranges()`（`ingest/git_diff.py`） | 有测试；`--changed` 目前是文件级过滤，行区间级裁剪未接（02 篇 2.4） |
@@ -74,6 +80,13 @@ codesage history                           # 最近记录（全局，全部项�
 codesage history --detail 25               # 完整重渲染 #25 次审查
 codesage history --project .               # 只看当前项目
 codesage history --feedback                # 附反馈统计
+
+# ---- ui：浏览器 GUI（v2 追加，需 web 依赖）----
+pip install -e ".[web]"                    # 安装 FastAPI / uvicorn
+python scripts/build_ui.py                 # 构建前端（Node 18+）
+codesage ui --path D:/myproject            # 默认 127.0.0.1:8787 并自动开浏览器
+codesage ui --port 8790 --no-browser       # 换端口 / 不开浏览器
+codesage ui --dev                          # 开发态：配合 cd web && npm run dev
 ```
 
 `review` 参数速查：

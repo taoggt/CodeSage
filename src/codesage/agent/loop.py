@@ -19,12 +19,14 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from codesage.agent.policies import StopPolicy
 from codesage.agent.registry import ToolRegistry
 from codesage.agent.state import AgentState
+from codesage.core.cancel import CancelToken
 from codesage.core.errors import LLMError
 from codesage.core.models import TokenUsage
 from codesage.llm.budget import BudgetState, TokenBudget
@@ -34,6 +36,8 @@ from codesage.llm.client import (
 )
 from codesage.llm.tokenizer import TokenEstimator
 from codesage.memory.working import WorkingMemory
+
+logger = logging.getLogger(__name__)
 
 # 压缩器：接收"中间区消息列表"，返回结构化摘要文本（由外部注入 LLM 实现）
 Compressor = Callable[[list[dict[str, Any]]], str]
@@ -77,6 +81,7 @@ class AgentLoop:
         compressor: Compressor | None = None,
         findings_counter: Callable[[], int] | None = None,
         on_event: EventHook | None = None,
+        cancel_token: CancelToken | None = None,
     ) -> None:
         self._client = client
         self._registry = registry
@@ -89,7 +94,11 @@ class AgentLoop:
         self._compressor = compressor
         self._findings_counter = findings_counter
         self._on_event = on_event
+        self._cancel_token = cancel_token
         self._compress_count = 0
+
+    def _cancelled(self) -> bool:
+        return self._cancel_token is not None and self._cancel_token.cancelled
 
     # ------------------------------------------------------------ 对外接口
 
@@ -104,6 +113,13 @@ class AgentLoop:
         self._emit("start", {"tools": self._registry.names()})
 
         while True:
+            # ---- 0. 取消检查（协作式：在每轮与每次外部调用前生效）
+            if self._cancelled():
+                result.status = "cancelled"
+                result.stop_reason = "用户取消"
+                self._emit("cancelled", {"turn": state.turn, "phase": "turn_start"})
+                break
+
             # ---- 1. 预算检查（调用前）
             context_tokens = self._estimate_context()
             budget_state = self._budget.state(context_tokens)
@@ -129,6 +145,11 @@ class AgentLoop:
                 self._compress(context_tokens)
 
             # ---- 2. LLM 调用
+            if self._cancelled():
+                result.status = "cancelled"
+                result.stop_reason = "用户取消"
+                self._emit("cancelled", {"turn": state.turn, "phase": "before_chat"})
+                break
             try:
                 response = self._client.chat(
                     self._memory.build(),
@@ -141,6 +162,18 @@ class AgentLoop:
                 break
 
             self._budget.record(response.usage)
+
+            # 模型的自然语言旁白（工具调用的"理由"），供 GUI 展示思考流
+            narration = (response.content or "").strip()
+            if narration:
+                self._emit(
+                    "assistant_message",
+                    {
+                        "turn": state.turn,
+                        "has_tool_calls": response.has_tool_calls,
+                        "preview": narration[:300],
+                    },
+                )
 
             # ---- 3a. 无工具调用 = 模型认为任务完成
             if not response.has_tool_calls:
@@ -156,9 +189,27 @@ class AgentLoop:
             # ---- 3b. 有工具调用：回填 assistant 消息 → 逐个执行工具
             self._memory.append(assistant_message_with_tool_calls(response))
             call_names = [tc.name for tc in response.tool_calls]
-            self._emit("tool_calls", {"turn": state.turn + 1, "names": call_names})
+            self._emit(
+                "tool_calls",
+                {
+                    "turn": state.turn + 1,
+                    "names": call_names,
+                    # 参数摘要供前端显示"Agent 在看哪个文件"，不传完整参数（体积可控）
+                    "args": [
+                        {
+                            "name": tc.name,
+                            "preview": str(tc.arguments)[:160].replace("\n", " "),
+                        }
+                        for tc in response.tool_calls
+                    ],
+                },
+            )
 
+            cancelled_in_tools = False
             for tc in response.tool_calls:
+                if self._cancelled():
+                    cancelled_in_tools = True
+                    break
                 output = self._registry.execute(
                     tc.name,
                     tc.arguments,
@@ -168,8 +219,18 @@ class AgentLoop:
                 state.tool_calls_total += 1
                 self._emit(
                     "tool_result",
-                    {"name": tc.name, "preview": output[:120].replace("\n", " ")},
+                    {
+                        "name": tc.name,
+                        "preview": output[:120].replace("\n", " "),
+                        "chars": len(output),
+                    },
                 )
+
+            if cancelled_in_tools:
+                result.status = "cancelled"
+                result.stop_reason = "用户取消"
+                self._emit("cancelled", {"turn": state.turn + 1, "phase": "tool_loop"})
+                break
 
             # ---- 4. 回合末：进展记录 + 停止检查 + 软阈值压缩
             state.turn += 1
@@ -224,4 +285,4 @@ class AgentLoop:
             try:
                 self._on_event(event, payload)
             except Exception:  # noqa: BLE001 - 事件钩子异常不影响主循环
-                pass
+                logger.exception("事件钩子执行失败：%s", event)

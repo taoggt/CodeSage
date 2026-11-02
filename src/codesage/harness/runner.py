@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from codesage.core.cancel import CancelToken
 from codesage.core.config import Settings
 from codesage.core.errors import HarnessError
 from codesage.harness.dataset import load_dataset
@@ -44,12 +45,14 @@ class EvalRunner:
         results_dir: Path,
         options: EvalOptions | None = None,
         on_progress: Callable[[str, int, int, dict], None] | None = None,
+        cancel_token: CancelToken | None = None,
     ) -> None:
         self._settings = settings
         self._dataset_dir = Path(dataset_dir)
         self._results_dir = Path(results_dir)
         self._options = options or EvalOptions()
         self._on_progress = on_progress
+        self._cancel_token = cancel_token
 
     def run(self, tag: str) -> dict:
         """执行评测，返回 summary，并写盘。"""
@@ -63,9 +66,13 @@ class EvalRunner:
         per_case: list[dict] = []
         total_tokens = 0
         total_cost = 0.0
+        cancelled = False
         started = time.perf_counter()
 
         for idx, case in enumerate(cases, start=1):
+            if self._cancel_token is not None and self._cancel_token.cancelled:
+                cancelled = True
+                break
             case_result = self._run_single_case(case, run_review, ReviewOptions)
             per_case.append(case_result)
             total_tokens += int(case_result.get("tokens", 0))
@@ -74,6 +81,7 @@ class EvalRunner:
                 self._on_progress(case.id, idx, len(cases), case_result)
 
         summary = aggregate(per_case)
+        completed = len(per_case)
         summary.update(
             {
                 "tag": tag,
@@ -82,8 +90,9 @@ class EvalRunner:
                 "duration_sec": round(time.perf_counter() - started, 2),
                 "total_tokens": total_tokens,
                 "total_cost_yuan": round(total_cost, 4),
-                "avg_cost_yuan": round(total_cost / len(cases), 4) if cases else 0.0,
+                "avg_cost_yuan": round(total_cost / completed, 4) if completed else 0.0,
                 "cases_detail": per_case,
+                "cancelled": cancelled,
             }
         )
 
@@ -115,6 +124,8 @@ class EvalRunner:
                     use_llm=not self._options.mock,
                     profile=self._options.profile,
                     quiet=True,
+                    # 评测案例跑在临时目录里：不写历史表，避免污染 reviews
+                    persist=False,
                 ),
             )
 

@@ -1,6 +1,6 @@
 # CodeSage
 
-> AI 代码审查 Agent（CLI）：确定性静态分析（零 Token）+ 自研 ReAct 内核（语义推理）
+> AI 代码审查 Agent（CLI + 本地浏览器 GUI）：确定性静态分析（零 Token）+ 自研 ReAct 内核（语义推理）
 
 一条命令完成代码质量分析、潜在 Bug 检测、性能建议、安全扫描与最佳实践推荐。
 
@@ -8,6 +8,7 @@
 codesage review ./src          # 审查目录
 codesage review app.py --no-llm  # 只跑确定性分析（零 API 成本）
 codesage eval --mock           # 运行评测（检出率 / 误报率 / 成本）
+codesage ui                    # 打开浏览器 GUI（审查过程可视化 + 错题本一键闭环）
 ```
 
 ## 核心设计哲学
@@ -38,6 +39,7 @@ codesage eval --mock           # 运行评测（检出率 / 误报率 / 成本�
 - **三区记忆压缩**：冻结区 / 压缩区 / 活跃区，60%/80% 双阈值触发——长审查不爆上下文，token 成本线性可控
 - **Harness 评测框架**：真实案例集 + 软匹配指标（检出率 / 误报率 / F1 / 成本）+ A/B 回归对比
 - **自优化闭环**：`feedback` 反馈 → 错题本沉淀 → Prompt 注入 → 评测验证
+- **本地浏览器 GUI**：审查过程可视化（阶段时间线 / 工具流水 / Token 仪表）、问题与源码行联动、错题本「注入预览」——只监听 127.0.0.1，`pip install -e ".[web]"` 可选安装
 - **CI 友好**：`--fail-on` 退出码、`--format json` 导出、`--changed` 增量审查
 
 ## 快速开始
@@ -56,9 +58,25 @@ codesage review ./your_project
 
 # 4. 评测（验证效果，量化数据）
 codesage eval --mock --tag baseline   # 无需 API Key
+
+# 5. 浏览器 GUI（可选）
+pip install -e ".[web]"
+python scripts/build_ui.py            # 构建前端（需 Node 18+，产物已随 wheel 打包时可跳过）
+codesage ui                           # 自动打开 http://127.0.0.1:8787
 ```
 
 配置优先级：环境变量 > `codesage.toml` > 默认值（模板见 `codesage.toml.example`）。
+
+> **升级 / 切换 Python 版本后，`codesage` 报 `cannot import name ... (unknown location)`？**
+> 虚拟环境不能跨小版本复用：`pydantic_core` 这类包带的是 `cp313` / `cp314` 专用 `.pyd`，
+> 只改 `pyvenv.cfg` 不会重装 site-packages。正确做法是先停掉正在运行的服务
+> （否则 `python.exe` 被占用，`venv` 会报 `Unable to copy venvlauncher.exe`），
+> 删掉 `.venv` 再用当前 Python 重建：
+>
+> ```bash
+> python -m venv .venv
+> .venv/Scripts/python.exe -m pip install -e ".[dev,web]"
+> ```
 
 ## 命令说明
 
@@ -102,22 +120,49 @@ codesage history --feedback      # 附带反馈统计
 
 审查记录存储在 `~/.codesage/store.db`（用户级，不写入被审查目录）；错题本经验按项目隔离。
 
+### `codesage ui`（浏览器 GUI）
+
+| 选项 | 说明 |
+| --- | --- |
+| `--path, -p` | 启动时打开的工作区目录（默认当前目录） |
+| `--port` | 监听端口，默认 8787 |
+| `--host` | 监听地址，**只允许回环地址**（127.0.0.1 / localhost） |
+| `--no-browser` | 不自动打开浏览器 |
+| `--dev` | 开发模式：不托管前端产物，配合 `cd web && npm run dev` |
+| `--config` | 指定 `codesage.toml`（默认按当前目录探测） |
+
+六个页面：**工作台**（文件树 / 代码行级标注 / 实时审查进度）、**报告**（评分 + P0–P3 分组 + 一键反馈）、**历史**（分页 / 评分趋势 / 两次对比）、**错题本**（经验管理 + 注入预览 + 手动补漏报）、**评测**（mock 运行 / 指标 / A-B）、**设置**（自检与维护）。
+
+选择工作区有三种方式（不需要手抄路径）：**系统文件夹对话框**（推荐，直接弹本机选择框）、**网页内目录浏览**（逐层点选，含盘符与常用位置）、**最近打开**；网络盘等特殊场景仍可手动输入。
+
+![工作台](docs/images/gui-workbench.png)
+
+![报告页](docs/images/gui-report.png)
+
+![错题本](docs/images/gui-lessons.png)
+
+**已知限制**（详见 `docs/GUI.md`）：取消是协作式的（在途 LLM 请求需先返回，≤120s）· 必须单进程单 worker · 仅回环地址、无登录 · 评测只有 5 例种子集，"误报率"用 1 − Precision 近似。
+
 ## 项目结构
 
 ```
 src/codesage/
-├── core/          # 领域模型（Finding/Report）、配置、异常
+├── core/          # 领域模型（Finding/Report）、配置、异常、取消令牌
 ├── ingest/        # 感知层：扫描 / 过滤 / 切块 / git diff 解析
 ├── analyzers/     # 确定性分析层：AST 规则引擎 + Ruff/Bandit/radon
 ├── agent/         # Agent 内核：ReAct 循环 / 工具注册表 / Prompt / 停止策略
 ├── tools/         # 工具集：read_file / search_code / run_analyzer / submit_finding ...
 ├── knowledge/     # 最佳实践知识库（卡片 + 关键词检索）
-├── memory/        # 三区压缩记忆 / SQLite 持久化 / 项目画像
+├── memory/        # 三区压缩记忆 / SQLite 持久化（WAL）/ 项目画像
 ├── llm/           # LLM 接入：客户端 / 模型路由 / Token 预算 / 估算器
 ├── optim/         # 自优化：反馈 / 错题本 / Prompt 版本管理
 ├── harness/       # 评测框架：数据集 / 指标 / 运行器 / A-B 对比
+├── services/      # 业务层：CLI 与 GUI 共用（工作区/审查/历史/反馈/错题本/评测）
+├── server/        # HTTP 层：FastAPI 路由 + 任务队列 + SSE + 静态托管
 ├── cli/           # Typer 命令 + Rich 渲染 + 导出
 └── pipeline.py    # 编排管线（扫描 → 分析 → Agent → 聚合 → 报告）
+
+web/               # 前端工程（React + TS + Vite + CodeMirror 6）
 ```
 
 ## 评测结果
@@ -155,17 +200,28 @@ src/codesage/
 | 语言支持     | 仅 Python（v1）        | tree-sitter 多语言       | 一个月周期做深优先于做广                               |
 | 知识检索     | 关键词打分卡片             | 向量检索                  | 卡片量小，检索收益边际低；接口已预留演进空间                     |
 | Token 计算 | 启发式估算（默认）           | 仅 tiktoken            | 零联网零依赖（tiktoken 首次运行需下载编码文件）；±20% 精度满足预算决策 |
-| 报告形态     | CLI + Markdown/JSON | Web UI                | 目标场景是开发工作流与 CI，前端投入产出比低                    |
+| 报告形态     | CLI 为主 + 本地 GUI 为辅    | 公网 Web 服务             | GUI 用来展示 ReAct 过程与错题本闭环（CLI 做不到）；只监听回环，不做多用户/鉴权 |
+| GUI 技术栈  | FastAPI + React/Vite（无 UI 库） | Streamlit / Gradio     | 需要行级代码标注与实时事件流；CodeMirror 只用核心 API，首屏 JS ≈194KB gzip |
+| 长任务模型    | 进程内线程池 + SSE          | Celery / Redis 队列      | 单机单人场景，外部队列是过度设计；代价是必须单进程单 worker |
 
 ## 开发
 
 ```bash
-.venv/Scripts/python.exe -m pytest      # 运行测试
-.venv/Scripts/python.exe -m ruff check src tests   # 代码检查
+.venv/Scripts/python.exe -m pytest                 # 运行测试（156 例）
+.venv/Scripts/python.exe -m ruff check src tests    # 代码检查
+
+# 前端开发态（Vite HMR，代理 /api 到 8787）
+codesage ui --dev                                   # 终端 A：只提供 API
+cd web && npm install && npm run dev                 # 终端 B：Vite 5173
+
+python scripts/build_ui.py                          # 构建产物到 src/codesage/server/static/
 ```
+
+GUI 的架构、API 契约与开发约定见 `docs/GUI.md`。
 
 ## Roadmap（v2）
 
+- [x] 本地浏览器 GUI（审查过程可视化 / 错题本闭环 / 评测面板）
 - [ ] tree-sitter 多语言支持（analyzer 协议已语言无关）
 - [ ] 向量检索知识库（`knowledge.query` 接口不变）
 - [ ] MCP Server 化（把 tools/ 注册表暴露为 MCP 协议）

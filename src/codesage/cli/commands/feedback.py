@@ -1,7 +1,10 @@
 """feedback 命令：反馈发现质量 + 错题本管理（自优化闭环的入口）。
 
-存储说明：使用全局存储（~/.codesage/store.db），无需指定项目目录；
-反馈的 project 字段自动从对应审查记录反查（错题本按项目隔离）。
+存储说明：使用全局存储（默认 ~/.codesage/store.db，可由 review.store_path 覆盖），
+无需指定项目目录；反馈的 project 字段自动从对应审查记录反查（错题本按项目隔离）。
+
+GUI 的等价能力：在报告页点「误报」即写入反馈并自动提炼经验（见 services/feedback_service）。
+CLI 保留显式的 `--mine` 步骤，便于讲清"采集 → 提炼 → 注入"的闭环。
 """
 
 from __future__ import annotations
@@ -12,20 +15,22 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from codesage.memory.store import Store, default_store_path
+from codesage.core.config import load_settings
+from codesage.memory.store import Store
 from codesage.optim.feedback import FeedbackEntry, record_feedback, verdict_label
 from codesage.optim.lessons import LessonBook
+from codesage.services.feedback_service import locate_finding
+from codesage.services.store_factory import open_store, resolve_store_path
 
 console = Console()
 
 
 def _locate_finding(store: Store, finding_id: str) -> tuple[dict | None, str]:
-    """在最近 50 次审查中定位一条发现，同时返回它所属的项目。"""
-    for row in store.recent_reviews(limit=50):
-        for finding in store.get_review_findings(int(row["id"])):
-            if str(finding.get("id")) == finding_id:
-                return finding, str(row.get("project") or "")
-    return None, ""
+    """在最近 50 次审查中定位一条发现，同时返回它所属的项目。
+
+    实现已下沉到 services/feedback_service（GUI 会带 review_id 走更快的路径）。
+    """
+    return locate_finding(store, finding_id)
 
 
 def _short_project(project: str) -> str:
@@ -56,19 +61,22 @@ def feedback(
       codesage feedback --mine     # 把反馈提炼为错题本经验
       codesage feedback --show     # 查看错题本
     """
-    db_path = default_store_path()
+    settings = load_settings()
+    db_path = resolve_store_path(settings)
     if not db_path.exists() and not mine:
         console.print(f"[yellow]暂无存储：{db_path}[/yellow]（先运行一次 review）")
         raise typer.Exit(2)
 
-    store = Store(db_path)
-    book = LessonBook(store)
-    try:
+    with open_store(settings) as store:
+        book = LessonBook(store)
+
         # ---- 查看错题本
         if show:
             lessons = book.all(limit=20)
             if not lessons:
-                console.print("[dim]错题本为空。用 `codesage feedback <id> -v wrong` 积累反馈。[/dim]")
+                console.print(
+                    "[dim]错题本为空。用 `codesage feedback <id> -v wrong` 积累反馈。[/dim]"
+                )
                 return
             table = Table(title="错题本（经验按项目隔离）", border_style="blue")
             table.add_column("ID", style="dim", justify="right")
@@ -137,5 +145,3 @@ def feedback(
         console.print(
             "[dim]提示：运行 `codesage feedback --mine` 把反馈提炼为错题本经验。[/dim]"
         )
-    finally:
-        store.close()
