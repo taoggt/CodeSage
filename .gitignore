@@ -21,6 +21,7 @@ QuickBootWithVenv.lnk
 
 # 环境与密钥
 .env
+docs/
 
 # IDE
 .idea/
