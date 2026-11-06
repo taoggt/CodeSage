@@ -10,15 +10,31 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
 
+from codesage.core.languages import Language, is_test_path, language_spec
 from codesage.core.models import Finding
 
 
 class Analyzer(ABC):
-    """确定性分析器协议。"""
+    """确定性分析器协议。
+
+    `languages` 是 v2 新增的维度：一个分析器声明自己能处理哪些语言，
+    pipeline 只把对应语言的文件喂给它。没有这个字段时，隐含约定是
+    "所有分析器都处理所有文件，且所有文件都是 Python"——一旦混入 .java，
+    Ruff 会报一堆解析错误。
+    """
 
     name: str = "analyzer"
     display: str = "分析器"
     supports_batch: bool = False  # True 时 pipeline 优先调用 run_batch（性能路径）
+    languages: tuple[Language, ...] = (Language.PYTHON,)
+    unavailable_hint: str = ""   # 工具缺失时给用户看的一句话（空 = 无需提示）
+
+    def supports(self, language: Language) -> bool:
+        return language in self.languages
+
+    def supports_any(self, languages: object) -> bool:
+        """languages 可以是 dict（键为 Language）、set、list 等任意可迭代对象。"""
+        return any(self.supports(lang) for lang in languages)  # type: ignore[union-attr]
 
     @abstractmethod
     def is_available(self) -> bool:
@@ -53,28 +69,25 @@ def tool_exists(executable: str) -> bool:
     return find_tool(executable) is not None
 
 
-_TEST_FILE_PREFIXES = ("test_", "conftest")
-_TEST_FILE_SUFFIX = "_test.py"
-_TEST_DIR_NAMES = {"test", "tests"}
-
-
-def is_test_file(path: str) -> bool:
+def is_test_file(path: str, language: Language | str = Language.PYTHON) -> bool:
     """判断路径是否属于测试代码（误报控制的关键基础设施）。
 
-    识别规则（pytest 生态的常见约定）：
-    - 目录：路径中出现 test/ 或 tests/ 目录；
-    - 文件名：test_*.py / *_test.py / conftest.py。
+    识别规则由 `core.languages.LanguageSpec` 按语言提供：
+    - Python：`test_*` / `*_test.py` / `conftest.py` / 路径含 test(s) 目录（pytest 约定）；
+    - Java：`*Test.java` / `*Tests.java` / `*IT.java` / `src/test/java/`（JUnit + Maven 约定）。
 
-    为什么需要它：测试代码有其领域惯例——大量使用 assert、
-    函数不写 docstring、fixture 中硬编码路径——这些在测试语境下
-    是标准做法，报告它们属于典型误报（会淹没真实问题）。
+    为什么需要它：测试代码有其领域惯例——大量使用 assert、函数不写 docstring、
+    硬编码路径——这些在测试语境下是标准做法，报告它们属于典型误报（会淹没真实问题）。
+
+    `language` 带默认值（PYTHON）是刻意的：历史调用点与 187 个测试全部是单参调用，
+    设成必填会引发大面积无关改动。
     """
-    normalized = path.replace("\\", "/")
-    p = Path(normalized)
-    name = p.name
-    if name.startswith(_TEST_FILE_PREFIXES) or name.endswith(_TEST_FILE_SUFFIX):
-        return True
-    return any(part in _TEST_DIR_NAMES for part in p.parts[:-1])
+    try:
+        spec = language_spec(language)
+    except ValueError:
+        # 未知语言不应让审查中断：退回 Python 规则（最接近历史行为）
+        spec = language_spec(Language.PYTHON)
+    return is_test_path(spec, path)
 
 
 def run_command(

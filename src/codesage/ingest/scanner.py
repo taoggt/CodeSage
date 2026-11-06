@@ -1,4 +1,11 @@
-"""目录扫描：产出待审查文件清单（含跳过原因，透明可解释）。"""
+"""目录扫描：产出待审查文件清单（含跳过原因，透明可解释）。
+
+v2 变更：跳过原因不再用中文字符串做控制流，改由 `SkipReason` 枚举判断。
+`skipped` 的形状保持 `list[(相对路径, 人话原因)]` 不变（报告/GUI 都消费它），
+另外新增两个计数视图：
+- `skip_counts`：按 SkipReason.value 计数（含"不逐条记录"的那一类）
+- `language_counts`：按语言统计**已纳入**的文件数（auto 探测的真正依据）
+"""
 
 from __future__ import annotations
 
@@ -6,7 +13,12 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from codesage.ingest.filters import FileFilter
+from codesage.core.languages import language_for_path
+from codesage.ingest.filters import FileFilter, SkipReason
+
+# 只有这一类跳过不逐条记录：混合仓库里非目标语言文件数量级过大，
+# 逐条塞进 skipped 会让报告体积和 GUI「已跳过」面板爆炸。
+QUIET_SKIP_REASONS: frozenset[SkipReason] = frozenset({SkipReason.UNSUPPORTED_LANGUAGE})
 
 
 @dataclass
@@ -15,10 +27,24 @@ class ScanResult:
 
     files: list[Path] = field(default_factory=list)
     skipped: list[tuple[str, str]] = field(default_factory=list)  # (相对路径, 原因)
+    skip_counts: dict[str, int] = field(default_factory=dict)     # SkipReason.value → 数量
+    language_counts: dict[str, int] = field(default_factory=dict) # 语言 → 已纳入文件数
 
     @property
     def total_candidates(self) -> int:
         return len(self.files) + len(self.skipped)
+
+    def record_skip(self, path_label: str, reason: SkipReason, detail: str) -> None:
+        self.skip_counts[reason.value] = self.skip_counts.get(reason.value, 0) + 1
+        if reason not in QUIET_SKIP_REASONS:
+            self.skipped.append((path_label, detail))
+
+    def record_file(self, path: Path) -> None:
+        self.files.append(path)
+        language = language_for_path(path)
+        if language is not None:
+            code = language.value
+            self.language_counts[code] = self.language_counts.get(code, 0) + 1
 
 
 def count_lines(path: Path) -> int:
@@ -40,11 +66,11 @@ def scan(root: Path, file_filter: FileFilter) -> ScanResult:
 
     # 单文件场景
     if root.is_file():
-        ok, reason = file_filter.should_include(root)
-        if ok:
-            result.files.append(root)
+        verdict = file_filter.classify(root)
+        if verdict is None:
+            result.record_file(root)
         else:
-            result.skipped.append((root.name, reason))
+            result.record_skip(root.name, verdict.reason, verdict.detail)
         return result
 
     for dirpath, dirnames, filenames in os.walk(root, topdown=True):
@@ -52,22 +78,26 @@ def scan(root: Path, file_filter: FileFilter) -> ScanResult:
         dirnames[:] = [d for d in dirnames if not file_filter.is_excluded_dir(d)]
         for name in sorted(filenames):
             path = Path(dirpath) / name
-            ok, reason = file_filter.should_include(path)
-            if not ok:
-                if reason != "非 Python 文件（v1 仅支持 Python）":
-                    # 非 Python 文件太多，不逐条记录，只记录有意义的跳过
-                    result.skipped.append((_rel(path, root), reason))
+            verdict = file_filter.classify(path)
+            if verdict is not None:
+                result.record_skip(_rel(path, root), verdict.reason, verdict.detail)
                 continue
+
             lines = count_lines(path)
-            if lines > file_filter.max_file_lines:
-                result.skipped.append(
-                    (_rel(path, root), f"大文件预过滤（{lines} 行 > {file_filter.max_file_lines}）")
+            limit = file_filter.max_lines_for(path)
+            if lines > limit:
+                result.record_skip(
+                    _rel(path, root),
+                    SkipReason.LARGE_FILE,
+                    f"大文件预过滤（{lines} 行 > {limit}）",
                 )
                 continue
             if lines <= 1:
-                result.skipped.append((_rel(path, root), "空文件或单行文件"))
+                result.record_skip(
+                    _rel(path, root), SkipReason.EMPTY_FILE, "空文件或单行文件"
+                )
                 continue
-            result.files.append(path)
+            result.record_file(path)
 
     result.files.sort()
     return result

@@ -25,6 +25,7 @@ from codesage.analyzers.base import (
     run_command,
     tool_exists,
 )
+from codesage.core.languages import Language
 from codesage.core.models import Category, Finding, Severity, Source
 
 # F 规则中代表明确逻辑问题的子集（提升严重级）
@@ -44,6 +45,8 @@ class RuffAnalyzer(Analyzer):
     name = "ruff"
     display = "Ruff（风格 / 命名 / 导入）"
     supports_batch = True
+    # Ruff 只解析 Python：混合仓库里必须靠这个声明把它挡在 .java 之外
+    languages = (Language.PYTHON,)
     select = "E,W,F,I,N"
 
     def is_available(self) -> bool:

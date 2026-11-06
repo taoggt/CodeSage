@@ -280,3 +280,26 @@ def test_lessons_visible_when_queried_with_posix_project(
 
     preview = client.get("/api/lessons/preview", params={"project": posix}).json()
     assert preview["chars"] > 0
+
+
+def test_meta_exposes_languages_and_java_source(client: TestClient) -> None:
+    """新增语言不需要改前端：/api/meta 的 languages 直接由注册表生成。"""
+    meta = client.get("/api/meta").json()
+    codes = {item["code"] for item in meta["languages"]}
+    assert {"python", "java"} <= codes
+    assert all(item["display"] for item in meta["languages"])
+
+    sources = {item["name"] for item in meta["sources"]}
+    assert "java_rule" in sources
+
+    # 扁平 key 是历史契约（前端与测试都按 key 取值），不能被改成纯嵌套
+    assert meta["analyzer_ready"]["ast_rule"] is True
+    assert "by_language" in meta["analyzer_ready"]
+
+
+def test_tree_entry_carries_language(client: TestClient, workspace: Path) -> None:
+    """文件树带 language（is_python 保留为兼容别名）。"""
+    tree = client.get("/api/workspace/tree", params={"root": str(workspace)}).json()
+    entries = {entry["name"]: entry for entry in tree["entries"]}
+    assert entries["a.py"]["language"] == "python"
+    assert entries["a.py"]["is_python"] is True

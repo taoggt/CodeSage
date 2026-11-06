@@ -1,5 +1,6 @@
+import { java } from "@codemirror/lang-java";
 import { python } from "@codemirror/lang-python";
-import { EditorState } from "@codemirror/state";
+import { Compartment, EditorState } from "@codemirror/state";
 import { EditorView, lineNumbers } from "@codemirror/view";
 import { useEffect, useRef } from "react";
 
@@ -20,7 +21,25 @@ interface Props {
   activeId?: string | null;
   jumpTo?: { line: number; token: number } | null;
   onSelectLine?: (line: number) => void;
+  /** 语言代码（python / java / typescript…），决定语法高亮器 */
+  language?: string;
   placeholder?: string;
+}
+
+/**
+ * 按语言选语法高亮扩展。
+ *
+ * 未识别的语言退回纯文本（不猜）——猜错的高亮比没有高亮更干扰阅读。
+ */
+function languageExtension(language?: string) {
+  switch ((language ?? "").toLowerCase()) {
+    case "java":
+      return java();
+    case "python":
+      return python();
+    default:
+      return [];
+  }
 }
 
 /**
@@ -34,12 +53,16 @@ export function CodeViewer({
   activeId,
   jumpTo,
   onSelectLine,
+  language,
   placeholder = "从左侧选择一个文件",
 }: Props) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const viewRef = useRef<EditorView | null>(null);
+  // Compartment 是 CodeMirror 的"可替换配置槽"：切换语言时只需 reconfigure，
+  // 不必销毁重建 EditorView（重建会丢滚动位置与选区）
+  const languageCompartment = useRef(new Compartment()).current;
 
-  // 创建 / 销毁编辑器
+  // 创建 / 销毁编辑器（language 变化走下面的 reconfigure，不进依赖数组）
   useEffect(() => {
     if (!hostRef.current) return;
     const view = new EditorView({
@@ -47,7 +70,7 @@ export function CodeViewer({
         doc: "",
         extensions: [
           lineNumbers(),
-          python(),
+          languageCompartment.of(languageExtension(language)),
           codeHighlighting,
           findingField,
           findingGutter,
@@ -64,7 +87,17 @@ export function CodeViewer({
       view.destroy();
       viewRef.current = null;
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // 切换文件语言：热替换高亮器（不销毁 view）
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    view.dispatch({
+      effects: languageCompartment.reconfigure(languageExtension(language)),
+    });
+  }, [language, languageCompartment]);
 
   // 切换文件：替换文档内容（不销毁 view，保留滚动容器与样式）
   useEffect(() => {

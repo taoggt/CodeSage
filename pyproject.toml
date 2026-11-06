@@ -23,6 +23,11 @@ dependencies = [
 dev = ["pytest>=8.0.0", "pytest-mock>=3.14.0", "httpx>=0.27"]
 # 浏览器 GUI：pip install -e ".[web]"
 web = ["fastapi>=0.110", "uvicorn[standard]>=0.29"]
+# Java 审查：pip install -e ".[java]"
+# 用 tree-sitter 而非 javalang：纯语法树、支持新语法（record/sealed/var）、
+# 有预编译 wheel 不需要 JDK，且未来加 Go/TS 可复用同一套封装。
+# 版本下限 0.23 是因为 Language/ Parser 的构造方式在 0.22 → 0.23 之间变过。
+java = ["tree-sitter>=0.23", "tree-sitter-java>=0.21"]
 
 [project.scripts]
 codesage = "codesage.cli.main:app"

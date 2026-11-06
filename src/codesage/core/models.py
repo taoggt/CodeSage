@@ -43,12 +43,14 @@ class Severity(str, Enum):
 
     @property
     def zh(self) -> str:
+        # 用 .get 兜底而非直接索引：枚举是增量扩展的，漏配中文名不应该让
+        # 整份报告渲染崩掉（旧实现是 dict[...] 直索引 → KeyError）。
         return {
             "critical": "严重",
             "major": "重要",
             "minor": "一般",
             "info": "提示",
-        }[self.value]
+        }.get(self.value, self.value)
 
 
 class Category(str, Enum):
@@ -68,13 +70,14 @@ class Category(str, Enum):
             "performance": "性能",
             "security": "安全",
             "best_practice": "最佳实践",
-        }[self.value]
+        }.get(self.value, self.value)
 
 
 class Source(str, Enum):
     """问题来源（决定置信度语义与展示方式）。"""
 
-    AST_RULE = "ast_rule"  # 自研 AST 规则（确定性）
+    AST_RULE = "ast_rule"  # 自研 AST 规则（确定性，Python）
+    JAVA_RULE = "java_rule"  # 自研 Java 规则 + 复杂度指标（确定性，Java）
     RUFF = "ruff"          # Ruff 静态检查
     BANDIT = "bandit"      # Bandit 安全扫描
     RADON = "radon"        # radon 复杂度分析
@@ -82,13 +85,45 @@ class Source(str, Enum):
 
     @property
     def zh(self) -> str:
+        # .get 兜底：新增来源漏配中文名时退化为枚举值，而不是 KeyError 崩报告
         return {
             "ast_rule": "规则",
+            "java_rule": "Java 规则",
             "ruff": "Ruff",
             "bandit": "Bandit",
             "radon": "radon",
             "llm": "LLM",
-        }[self.value]
+        }.get(self.value, self.value)
+
+
+def coerce_source(raw: object) -> Source:
+    """把任意 raw 值收敛为 Source。
+
+    容错的意义：数据库里的 payload 是跨版本共享的——旧版 GUI 可能读到新版写入的
+    `java_rule`。直接 `Source(value)` 会抛 ValueError 让整个历史页白屏，
+    而降级成 AST_RULE 至少还能展示（来源徽章不准，但信息不丢）。
+    """
+    if isinstance(raw, Source):
+        return raw
+    try:
+        return Source(str(raw))
+    except ValueError:
+        return Source.AST_RULE
+
+
+def resolve_language_code(explicit: object, file_path: object = "") -> str:
+    """解析语言代码：显式值 → 按文件名后缀推断 → 回退 python。"""
+    from codesage.core.languages import (
+        Language,
+        all_specs,
+        language_spec_for_path,
+    )
+
+    value = str(explicit or "").strip().lower()
+    if value in {spec.code for spec in all_specs()}:
+        return value
+    spec = language_spec_for_path(str(file_path or ""))
+    return spec.code if spec is not None else Language.PYTHON.value
 
 
 @dataclass
@@ -100,6 +135,10 @@ class Finding:
     - line_start / line_end: 1-based 行号范围
     - confidence: 置信度 0~1（规则类通常 0.6~1.0；LLM 确认后由模型给出）
     - source + rule_id: 溯源信息（报告里展示“由谁发现”）
+    - language: 所属语言代码（python / java）。空串表示"未标注"，
+      读取时按 file 后缀推断——历史 payload 没有这个字段，不能因此崩。
+      为什么放在 Finding 而不是 ReviewReport：一次审查可能是混合仓库，
+      报告级单一语言字段会让导出围栏与逐文件高亮全部失效。
     """
 
     file: str
@@ -114,6 +153,7 @@ class Finding:
     confidence: float = 1.0
     source: Source = Source.AST_RULE
     rule_id: str = ""
+    language: str = ""
 
     @property
     def id(self) -> str:
@@ -130,11 +170,21 @@ class Finding:
         """去重键：同文件 + 相近行 + 同类别视为同一问题（保留高置信度者）。"""
         return f"{self.file}:{self.line_start // 3}:{self.category.value}"
 
+    @property
+    def language_code(self) -> str:
+        """解析后的语言代码：显式字段优先，其次按文件名后缀推断，最后回退 python。
+
+        为什么需要三层：LLM 提交的 finding 不会填 language（它只看得到代码），
+        历史 payload 完全没有这个字段，而导出围栏/前端高亮都需要一个确定值。
+        """
+        return resolve_language_code(self.language, self.file)
+
     def to_dict(self) -> dict:
         d = asdict(self)
         d["category"] = self.category.value
         d["severity"] = self.severity.value
         d["source"] = self.source.value
+        d["language"] = self.language_code
         d["id"] = self.id
         d["severity_label"] = self.severity.label
         return d
@@ -152,8 +202,10 @@ class Finding:
             suggestion=d.get("suggestion", ""),
             evidence=d.get("evidence", ""),
             confidence=float(d.get("confidence", 1.0)),
-            source=Source(d.get("source", "ast_rule")),
+            # 容错：新版本写入的来源（如 java_rule）被旧版本读到时不抛 ValueError
+            source=coerce_source(d.get("source")),
             rule_id=d.get("rule_id", ""),
+            language=resolve_language_code(d.get("language"), d.get("file")),
         )
 
 
@@ -292,10 +344,15 @@ def dedup_findings(findings: list[Finding]) -> list[Finding]:
 
     来源优先级：LLM（语义确认过）> 自研规则（中文描述与修复建议最完整）
     > Bandit > Ruff > radon。
+
+    Java 规则与 Python 自研规则同级（都是 1）——它们不会同时出现在同一个
+    文件的同一行上（语言互斥），排同一档只是为了让未来"跨语言同构检查"
+    的出现顺序可预测。
     """
     source_priority = {
         Source.LLM: 0,
         Source.AST_RULE: 1,
+        Source.JAVA_RULE: 1,
         Source.BANDIT: 2,
         Source.RUFF: 3,
         Source.RADON: 4,

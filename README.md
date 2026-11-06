@@ -28,19 +28,20 @@ codesage ui                    # 打开浏览器 GUI（审查过程可视化 + �
 
 | 通道    | 任务                               | 成本      |
 | ----- | -------------------------------- | ------- |
-| 确定性层  | 文件筛选、AST 规则、Ruff/Bandit/radon 扫描 | 零 Token |
+| 确定性层  | 文件筛选、自研规则、外部工具扫描（Python / Java） | 零 Token |
 | LLM 层 | 候选复核（误报过滤）、逻辑/边界问题发现、修复建议        | 按量计费    |
 | 评测层   | Harness 驱动真实链路，量化质量与成本           | 评测时计费   |
 
 ## 特性
 
 - **自研 Agent 内核（零框架依赖）**：约 150 行的 ReAct 循环，`function calling` 协议驱动——模型每一轮决策、工具执行、错误回填与停止条件都清晰可调试
-- **13 条自研 AST 规则 + 3 个外部分析器**：覆盖质量 / Bug / 性能 / 安全 / 最佳实践五个维度，确定性发现零成本
+- **Python + Java 双语言**：13 条 Python AST 规则 + 10 条 Java 规则（tree-sitter 语法层，零 JVM 依赖）+ 3 个外部分析器，覆盖质量 / Bug / 性能 / 安全 / 最佳实践五个维度
+- **语言注册表驱动**：`LanguageSpec` 是"一种语言是什么样"的单一真相源（后缀、测试文件约定、审核人设、导出围栏、框架线索），新增语言是加数据而非改内核
 - **三区记忆压缩**：冻结区 / 压缩区 / 活跃区，60%/80% 双阈值触发——长审查不爆上下文，token 成本线性可控
 - **Harness 评测框架**：真实案例集 + 软匹配指标（检出率 / 误报率 / F1 / 成本）+ A/B 回归对比
 - **自优化闭环**：`feedback` 反馈 → 错题本沉淀 → Prompt 注入 → 评测验证
-- **本地浏览器 GUI**：审查过程可视化（阶段时间线 / 工具流水 / Token 仪表）、问题与源码行联动、错题本「注入预览」——只监听 127.0.0.1，`pip install -e ".[web]"` 可选安装
-- **CI 友好**：`--fail-on` 退出码、`--format json` 导出、`--changed` 增量审查
+- **本地浏览器 GUI**：审查过程可视化（阶段时间线 / 工具流水 / Token 仪表）、问题与源码行联动、按语言语法高亮、错题本「注入预览」——只监听 127.0.0.1，`pip install -e ".[web]"` 可选安装
+- **CI 友好**：`--fail-on` 退出码、`--format json` 导出、`--changed` 增量审查、`--language` 限定语言
 
 ## 快速开始
 
@@ -49,6 +50,9 @@ codesage ui                    # 打开浏览器 GUI（审查过程可视化 + �
 python -m venv .venv
 .venv/Scripts/activate        # Windows（Linux/macOS: source .venv/bin/activate）
 pip install -e ".[dev]"
+
+# 1.1 可选：启用 Java 审查（tree-sitter 语法解析，无需 JDK）
+pip install -e ".[java]"
 
 # 2. 配置 LLM（可选——不配置可运行 --no-llm 模式）
 cp .env.example .env          # 填入 DeepSeek / OpenAI 兼容服务的 API Key
@@ -64,6 +68,11 @@ pip install -e ".[web]"
 python scripts/build_ui.py            # 构建前端（需 Node 18+，产物已随 wheel 打包时可跳过）
 codesage ui                           # 自动打开 http://127.0.0.1:8787
 ```
+
+> 语言范围默认 `auto`：目录里有 `.py` 就审 Python、有 `.java` 就审 Java（两者并存则都审）。
+> 也可以用 `--language python` / `java` / `python,java` 显式限定。
+> 未安装 `[java]` 时 `.java` 仍会进入 LLM 语义审查，但确定性规则会跳过并明确提示——
+> 不会静默漏检。
 
 配置优先级：环境变量 > `codesage.toml` > 默认值（模板见 `codesage.toml.example`）。
 
@@ -86,11 +95,17 @@ codesage ui                           # 自动打开 http://127.0.0.1:8787
 | ---------------- | ---------------------------------------- |
 | `--no-llm`       | 只跑确定性分析（零 Token，无需 API Key）              |
 | `--changed`      | 只审查 git 变更涉及的文件（增量模式）                    |
+| `--language, -L` | 语言范围：`auto`（默认，按目录实际存在）/ `python` / `java` / `python,java` |
 | `--profile`      | 审查角色：`full` / `security` / `performance` |
 | `--format`       | 输出格式：`terminal` / `markdown` / `json`    |
 | `--output`       | 导出到文件（配合 `--format`）                     |
 | `--min-severity` | 终端展示的最低严重级                               |
 | `--fail-on`      | CI 退出码阈值（`critical`/`major`/`minor`）     |
+
+```bash
+codesage review .                      # auto：有 .py 审 Python、有 .java 审 Java
+codesage review . --language java      # 只审 Java（.py 会被静默排除，但会计数）
+```
 
 ### `codesage eval`
 
@@ -135,15 +150,25 @@ codesage history --feedback      # 附带反馈统计
 
 选择工作区有三种方式（不需要手抄路径）：**系统文件夹对话框**（推荐，直接弹本机选择框）、**网页内目录浏览**（逐层点选，含盘符与常用位置）、**最近打开**；网络盘等特殊场景仍可手动输入。
 
+<<<<<<< HEAD
 **已知限制**（详见 `docs/GUI.md`）：取消是协作式的（在途 LLM 请求需先返回，≤120s）· 必须单进程单 worker · 仅回环地址、无登录 · 评测只有 5 例种子集，"误报率"用 1 − Precision 近似。
+=======
+![工作台](docs/images/gui-workbench.png)
+
+![报告页](docs/images/gui-report.png)
+
+![错题本](docs/images/gui-lessons.png)
+
+**已知限制**（详见 `docs/GUI.md`）：取消是协作式的（在途 LLM 请求需先返回，≤120s）· 必须单进程单 worker · 仅回环地址、无登录 · 评测是种子集（Python 5 例 + Java 8 例），"误报率"用 1 − Precision 近似。
+>>>>>>> e7a1a35 (增加对Java的支持)
 
 ## 项目结构
 
 ```
 src/codesage/
-├── core/          # 领域模型（Finding/Report）、配置、异常、取消令牌
+├── core/          # 领域模型（Finding/Report）、配置、语言注册表、异常、取消令牌
 ├── ingest/        # 感知层：扫描 / 过滤 / 切块 / git diff 解析
-├── analyzers/     # 确定性分析层：AST 规则引擎 + Ruff/Bandit/radon
+├── analyzers/     # 确定性分析层：Python AST 规则 + Java 规则（tree-sitter）+ Ruff/Bandit/radon
 ├── agent/         # Agent 内核：ReAct 循环 / 工具注册表 / Prompt / 停止策略
 ├── tools/         # 工具集：read_file / search_code / run_analyzer / submit_finding ...
 ├── knowledge/     # 最佳实践知识库（卡片 + 关键词检索）
@@ -161,16 +186,22 @@ web/               # 前端工程（React + TS + Vite + CodeMirror 6）
 
 ## 评测结果
 
-运行 `codesage eval --mock`（确定性层 · 5 个种子案例 · 零 API 成本）实测：
+运行 `codesage eval --mock`（确定性层 · 零 API 成本）实测：
 
-| 配置         | 检出率                                            | 精确率* | F1        | 平均成本/案例 |
-| ---------- | ---------------------------------------------- | ---- | --------- | ------- |
-| 确定性层（mock） | **100%** (5/5)                                 | 75%  | **0.857** | ¥0      |
-| 完整链路（LLM）  | 待填（需 API Key 后运行 `codesage eval --tag v1-llm`） |      |           |         |
+| 数据集 | 配置 | 检出率 | 精确率* | F1 | 平均成本/案例 |
+| --- | --- | --- | --- | --- | --- |
+| `examples/eval_dataset`（Python · 5 例） | 确定性层（mock） | **100%** (5/5) | 76.9% | **0.870** | ¥0 |
+| `examples/eval_dataset_java`（Java · 8 例） | 确定性层（mock） | **100%** (8/8) | 100% | **1.000** | ¥0 |
+| 完整链路（LLM） | 待填 | 需 API Key 后运行 `codesage eval --tag v1-llm` | | | |
 
 \* 精确率为近似指标：案例工作区隔离后，同一片段中的其他真实问题也会计入分母（详见 `harness/metrics.py` 的诚实标注）。
 
-数据集：`examples/eval_dataset/`（种子 5 案例；扩充方法见该目录 README）
+> **Java 那行的 100% 是"接线正确"，不是"效果很好"**：8 个片段是照着 9 条
+> 规则的触发特征构造的（一规则一案例），所以它证明的是"语言分派 / 行号换算 /
+> 严重级映射 / 报告落盘"没有错位，而不是工具能发现真实项目里的缺陷。
+> 真正的召回率要靠真实 bug 挖掘（扩充方法见各数据集的 README）。
+
+数据集：`examples/eval_dataset/`（Python 5 例）、`examples/eval_dataset_java/`（Java 8 例）
 
 ## 性能实践（自举审查发现的优化）
 
@@ -191,17 +222,18 @@ web/               # 前端工程（React + TS + Vite + CodeMirror 6）
 | 决策       | 选择                  | 放弃                    | 理由                                         |
 | -------- | ------------------- | --------------------- | ------------------------------------------ |
 | Agent 框架 | 自研 ReAct 内核         | LangChain / LangGraph | 压缩时机与预算需精确控制；零学习成本；面试能讲原理而非报框架名            |
-| 语言支持     | 仅 Python（v1）        | tree-sitter 多语言       | 一个月周期做深优先于做广                               |
+| 语言支持     | Python + Java（两段式）  | 全语言 tree-sitter 统一 IR | 语法层用 tree-sitter，语义层交给 LLM；不为"看起来统一"而强行抹平两套语法结构 |
+| Java 工具链   | 自研 10 条规则（零 JVM）   | Checkstyle / PMD / SpotBugs | 一条 `pip install -e ".[java]"` 就能跑；JVM 工具的 jar 与版本管理是接入成本大头，留阶段二 |
 | 知识检索     | 关键词打分卡片             | 向量检索                  | 卡片量小，检索收益边际低；接口已预留演进空间                     |
 | Token 计算 | 启发式估算（默认）           | 仅 tiktoken            | 零联网零依赖（tiktoken 首次运行需下载编码文件）；±20% 精度满足预算决策 |
 | 报告形态     | CLI 为主 + 本地 GUI 为辅    | 公网 Web 服务             | GUI 用来展示 ReAct 过程与错题本闭环（CLI 做不到）；只监听回环，不做多用户/鉴权 |
-| GUI 技术栈  | FastAPI + React/Vite（无 UI 库） | Streamlit / Gradio     | 需要行级代码标注与实时事件流；CodeMirror 只用核心 API，首屏 JS ≈194KB gzip |
+| GUI 技术栈  | FastAPI + React/Vite（无 UI 库） | Streamlit / Gradio     | 需要行级代码标注与实时事件流；CodeMirror 只用核心 API，首屏 JS ≈208KB gzip（含 Python + Java 语法包） |
 | 长任务模型    | 进程内线程池 + SSE          | Celery / Redis 队列      | 单机单人场景，外部队列是过度设计；代价是必须单进程单 worker |
 
 ## 开发
 
 ```bash
-.venv/Scripts/python.exe -m pytest                 # 运行测试（156 例）
+.venv/Scripts/python.exe -m pytest                 # 运行测试（280 例）
 .venv/Scripts/python.exe -m ruff check src tests    # 代码检查
 
 # 前端开发态（Vite HMR，代理 /api 到 8787）
@@ -213,10 +245,12 @@ python scripts/build_ui.py                          # 构建产物到 src/codesa
 
 GUI 的架构、API 契约与开发约定见 `docs/GUI.md`。
 
-## Roadmap（v2）
+## Roadmap
 
 - [x] 本地浏览器 GUI（审查过程可视化 / 错题本闭环 / 评测面板）
-- [ ] tree-sitter 多语言支持（analyzer 协议已语言无关）
+- [x] 多语言支持：Java（tree-sitter 语法层 + 10 条自研规则，零 JVM 依赖）
+- [ ] 阶段二：JVM 工具链（Checkstyle / PMD / SpotBugs，XML 输出解析）+ 需要类型解析的检测（`@Transactional` 自调用）
+- [ ] 更多语言（Go / TypeScript）：注册表 + 一个语法包 + 一套规则即可复用现有链路
 - [ ] 向量检索知识库（`knowledge.query` 接口不变）
 - [ ] MCP Server 化（把 tools/ 注册表暴露为 MCP 协议）
 - [ ] GitHub Action / PR Bot 集成

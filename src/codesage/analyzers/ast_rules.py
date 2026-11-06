@@ -17,6 +17,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
 from codesage.analyzers.base import is_test_file
+from codesage.core.languages import Language, language_for_path
 from codesage.core.models import Category, Finding, Severity, Source
 
 # ---------------------------------------------------------------- 基础设施
@@ -592,17 +593,42 @@ RULE_IDS = [
 
 
 class RuleEngine:
-    """规则引擎：单次解析，多规则执行。"""
+    """规则引擎：单次解析，多规则执行。
+
+    v2 起它是一个"语言专属引擎"：只处理 Python。语言守卫（run 的首行）不是
+    防御性编程洁癖，而是**必须**——`ast.parse` 遇到 Java 源码会抛 SyntaxError，
+    旧行为会据此产出 `CG000`「语法错误 MAJOR」并严重扣分，把"不支持 Java"
+    伪装成"你的 Java 代码有语法错误"。
+    """
+
+    name = "ast_rule"
+    language = Language.PYTHON
+    languages: tuple[Language, ...] = (Language.PYTHON,)
 
     def __init__(self, rules: list[Rule] | None = None) -> None:
         self.rules = rules if rules is not None else default_rules()
 
+    def supports(self, language: Language) -> bool:
+        return language in self.languages
+
+    def supports_any(self, languages: object) -> bool:
+        return any(self.supports(lang) for lang in languages)  # type: ignore[union-attr]
+
+    def is_available(self) -> bool:
+        """标准库 ast 恒可用，无需探测。"""
+        return True
+
     def run(self, filename: str, source: str) -> list[Finding]:
         """解析源码并执行全部规则。
 
+        - 非 Python 文件：直接返回空（语言守卫）；
         - 语法错误：报告一条 MAJOR（bug 类），后续规则无法执行；
         - 单条规则异常：跳过该规则（不影响其他规则）。
         """
+        detected = language_for_path(filename)
+        if detected is not None and detected is not Language.PYTHON:
+            return []
+
         try:
             tree = ast.parse(source)
         except SyntaxError as exc:
@@ -617,6 +643,7 @@ class RuleEngine:
                     description=f"文件无法解析（{exc.__class__.__name__}），请先修复语法。",
                     source=Source.AST_RULE,
                     rule_id="CG000",
+                    language=Language.PYTHON.value,
                 )
             ]
 

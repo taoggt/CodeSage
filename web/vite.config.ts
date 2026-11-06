@@ -21,6 +21,9 @@ export default defineConfig({
             "@codemirror/view",
             "@codemirror/language",
             "@codemirror/lang-python",
+            // Java 语法包必须显式列进来：否则 Rollup 会把它算进入口 chunk，
+            // 入口体积翻倍且与业务代码同生共死（改一行页面代码就失效缓存）
+            "@codemirror/lang-java",
           ],
           "vendor-charts": ["recharts"],
         },

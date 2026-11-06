@@ -1,0 +1,8 @@
+id: case_002
+category: bug
+description: 过宽异常捕获 - catch Throwable 把编程错误与业务异常混为一谈（对应 JG002）
+snippet: snippets/case_002.java
+ground_truth:
+  line_range: [5, 7]
+  severity: major
+  keywords: ["过宽", "Throwable", "异常捕获"]

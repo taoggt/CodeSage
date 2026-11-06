@@ -26,6 +26,8 @@ class ReviewJobRequest(BaseModel):
     changed_only: bool = False
     max_turns: int | None = Field(default=None, ge=1, le=50)
     keep_partial: bool = True
+    # 语言范围：None = 沿用配置（默认 auto）。取值同 CLI --language。
+    languages: str | None = None
 
 
 class FeedbackRequest(BaseModel):

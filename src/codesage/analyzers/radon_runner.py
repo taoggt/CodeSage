@@ -7,6 +7,7 @@ radon 作为 Python 库直接调用（比其他分析器少一次子进程开销
 from __future__ import annotations
 
 from codesage.analyzers.base import Analyzer, is_test_file
+from codesage.core.languages import Language
 from codesage.core.models import Category, Finding, Severity, Source
 
 # 复杂度阈值（radon 惯例：>10 需要关注，>20 需要重构）
@@ -17,6 +18,8 @@ COMPLEXITY_MAJOR = 20
 class RadonAnalyzer(Analyzer):
     name = "radon"
     display = "radon（复杂度分析）"
+    # radon 内部用自建的 Python AST visitor，无法处理其他语言
+    languages = (Language.PYTHON,)
 
     def is_available(self) -> bool:
         try:

@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Callable
 
 from codesage.agent.registry import tool
+from codesage.core.languages import Language, language_spec_for_path
 from codesage.tools.read_file import _resolve_inside
 
 
@@ -33,46 +34,78 @@ def _format_returns(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
     return ""
 
 
+def _outline_python(source: str) -> list[str]:
+    tree = ast.parse(source)
+    lines: list[str] = []
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef):
+            bases = ", ".join(
+                ast.unparse(b) for b in node.bases if not isinstance(b, ast.Name)
+            )
+            suffix = f"({bases})" if bases else ""
+            lines.append(f"L{node.lineno} class {node.name}{suffix}")
+            for item in node.body:
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    lines.append(
+                        f"  L{item.lineno} def {item.name}"
+                        f"({_format_args(item)}){_format_returns(item)}"
+                    )
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            lines.append(
+                f"L{node.lineno} def {node.name}"
+                f"({_format_args(node)}){_format_returns(node)}"
+            )
+    return lines
+
+
+class _Unavailable(Exception):
+    """依赖缺失（不是代码问题，需要给模型一句准确的话）。"""
+
+
+def _outline_for(path: str, source: str) -> list[str]:
+    """按语言分派符号大纲。
+
+    关键点：非 Python 文件**不能**落到 `ast.parse` 上——它会抛 SyntaxError，
+    而工具会把错误包装成"语法错误无法解析"，模型于是以为代码有语法问题。
+    这是最误导人的一种失败模式，所以语言必须在进入解析前先判断。
+    """
+    spec = language_spec_for_path(path)
+    if spec is None:
+        return []
+    if spec.language is Language.JAVA:
+        from codesage.analyzers import java_parser
+
+        if not java_parser.is_available():
+            raise _Unavailable(
+                '当前环境未安装 tree-sitter-java，无法为 Java 文件生成符号大纲'
+                '（pip install -e ".[java]"）。可改用 read_file 按行读取。'
+            )
+        return java_parser.build_java_outline(source)
+    return _outline_python(source)
+
+
 def make_list_symbols_tool(workspace: Path) -> Callable[..., str]:
     root = Path(workspace).resolve()
 
     @tool(name="list_symbols")
     def list_symbols(path: str) -> str:
-        """列出文件的符号大纲（类 / 函数 / 方法签名 + 行号）。
+        """列出文件的符号大纲（类 / 接口 / 函数 / 方法签名 + 行号）。
 
         Args:
-            path: 相对工作区路径
+            path: 相对工作区路径（.py 或 .java）
         """
         target = _resolve_inside(root, path)
         if target is None or not target.is_file():
             return f"ERROR: 文件不存在或路径非法：{path}"
         try:
             source = target.read_text(encoding="utf-8", errors="replace")
-            tree = ast.parse(source)
+            lines = _outline_for(path, source)
+        except _Unavailable as exc:
+            return f"ERROR: {exc}"
         except SyntaxError as exc:
             return f"ERROR: 语法错误无法解析（line {exc.lineno}）：{exc.msg}"
         except OSError as exc:
             return f"ERROR: 读取失败：{exc}"
-
-        lines: list[str] = []
-        for node in tree.body:
-            if isinstance(node, ast.ClassDef):
-                bases = ", ".join(
-                    ast.unparse(b) for b in node.bases if not isinstance(b, ast.Name)
-                )
-                suffix = f"({bases})" if bases else ""
-                lines.append(f"L{node.lineno} class {node.name}{suffix}")
-                for item in node.body:
-                    if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                        lines.append(
-                            f"  L{item.lineno} def {item.name}"
-                            f"({_format_args(item)}){_format_returns(item)}"
-                        )
-            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                lines.append(
-                    f"L{node.lineno} def {node.name}"
-                    f"({_format_args(node)}){_format_returns(node)}"
-                )
 
         if not lines:
             return "（文件中没有类或函数定义）"

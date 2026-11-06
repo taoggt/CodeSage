@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from codesage.core.languages import LANGUAGE_SPECS
 from codesage.core.models import ReviewReport
 
 _SEV_BADGE = {
@@ -13,6 +14,18 @@ _SEV_BADGE = {
     "minor": "🟡 P2",
     "info": "🔵 P3",
 }
+
+
+def markdown_fence(language_code: str) -> str:
+    """代码围栏名（```java / ```python）。
+
+    围栏不对会让 Markdown 渲染器按错误语法高亮，PR 评论里非常显眼。
+    未注册语言退回 text（不猜）。
+    """
+    for spec in LANGUAGE_SPECS.values():
+        if spec.code == language_code:
+            return spec.markdown_fence
+    return "text"
 
 
 def to_markdown(report: ReviewReport) -> str:
@@ -62,7 +75,7 @@ def to_markdown(report: ReviewReport) -> str:
             lines.append(f.description)
         if f.evidence:
             lines.append("")
-            lines.append(f"```python\n{f.evidence}\n```")
+            lines.append(f"```{markdown_fence(f.language_code)}\n{f.evidence}\n```")
         if f.suggestion:
             lines.append("")
             lines.append(f"> **建议**：{f.suggestion}")

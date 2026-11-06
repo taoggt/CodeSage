@@ -76,3 +76,59 @@ def test_invalid_enum_returns_error_text():
     output = submit(tool, category="not_a_category")
     assert output.startswith("ERROR")
     assert not collector
+
+
+# ---------------------------------------------------------------- 多语言工具行为
+
+
+def test_list_symbols_java_outline(tmp_path: Path) -> None:
+    """Java 文件的符号大纲走 tree-sitter，不能落到 ast.parse 上。"""
+    from codesage.analyzers import java_parser
+    from codesage.tools.list_symbols import make_list_symbols_tool
+
+    if not java_parser.is_available():
+        import pytest
+
+        pytest.skip('未安装 tree-sitter-java（pip install -e ".[java]"）')
+
+    (tmp_path / "Demo.java").write_text(
+        "public class Demo {\n"
+        "    public int compute(int a) throws IllegalStateException { return a; }\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    tool = make_list_symbols_tool(tmp_path)
+    output = tool(path="Demo.java")
+
+    assert "符号大纲" in output
+    assert "class Demo" in output
+    assert "compute(int a)" in output
+    assert "语法错误" not in output  # 旧实现的误导性文案绝不能出现
+
+
+def test_run_analyzer_rejects_wrong_language(tmp_path: Path) -> None:
+    """把 .java 喂给 ruff 必须被拦下并给出可用分析器指引。"""
+    from codesage.analyzers import BanditAnalyzer, JavaRuleEngine, RuffAnalyzer
+    from codesage.tools.run_analyzer import make_run_analyzer_tool
+
+    (tmp_path / "Demo.java").write_text("class Demo {}\n", encoding="utf-8")
+    tool = make_run_analyzer_tool(
+        [RuffAnalyzer(), BanditAnalyzer(), JavaRuleEngine()], tmp_path
+    )
+    output = tool(analyzer="ruff", path="Demo.java")
+
+    assert output.startswith("ERROR")
+    assert "java_rule" in output      # 告诉模型该用哪个
+    assert "不支持" in output
+
+
+def test_run_analyzer_rejects_python_file_for_java_engine(tmp_path: Path) -> None:
+    from codesage.analyzers import JavaRuleEngine, RuffAnalyzer
+    from codesage.tools.run_analyzer import make_run_analyzer_tool
+
+    (tmp_path / "a.py").write_text("x = 1\n", encoding="utf-8")
+    tool = make_run_analyzer_tool([RuffAnalyzer(), JavaRuleEngine()], tmp_path)
+    output = tool(analyzer="java_rule", path="a.py")
+
+    assert output.startswith("ERROR")
+    assert "ruff" in output

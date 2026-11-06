@@ -1,27 +1,33 @@
 # ============================================================
 # CodeSage 项目配置模板
 # 复制为 codesage.toml 放在运行目录即可生效（也可以全部用环境变量覆盖）
-# 优先级：环境变量 > codesage.toml > 代码默认值
+# 优先级：环境变量 > .env > codesage.toml > 代码默认值
 # ============================================================
 
 [llm]
 # API Key 建议放 .env，不要写进这里提交到 git
 base_url = "https://api.deepseek.com"
-model_strong = "deepseek-chat"     # 深度审查使用的模型
-model_fast = "deepseek-chat"       # 工具决策 / 摘要压缩使用的模型
+model_strong = "deepseek-flash"    # 深度审查（现役 V4.1-Flash，1M 上下文）
+model_fast = "deepseek-flash"      # 工具决策 / 摘要压缩
 temperature = 0.2
-max_output_tokens = 4096
+max_output_tokens = 8192           # 单次输出上限，够覆盖一份完整审查报告
 timeout = 120.0
 
 [budget]
-context_window = 64000        # 模型上下文窗口（token）
-soft_ratio = 0.6              # 使用率 ≥ 60%：回合边界触发压缩
-hard_ratio = 0.8              # 使用率 ≥ 80%：调用前强制压缩
-abort_ratio = 0.95            # 使用率 ≥ 95%：熔断，输出已有发现
-input_price_per_m = 2.0       # 输入单价（元 / 百万 token），用于成本估算
-output_price_per_m = 8.0      # 输出单价（元 / 百万 token）
+# 两个窗口分工不同，别混为一谈：
+#   context_window = 模型标称上限，只用于校验与展示
+#   budget_window  = 单次审查真正可用的额度，三区阈值以它为分母
+# 把 budget_window 设成 1M 不会让审查更准，只会让压缩永不触发、单轮成本翻倍。
+context_window = 1000000      # 模型标称上下文窗口（token）
+budget_window = 120000        # 工作预算（token）← 压缩与熔断按这个算
+soft_ratio = 0.6              # 预算使用率 ≥ 60%：回合边界触发压缩
+hard_ratio = 0.8              # 预算使用率 ≥ 80%：调用前强制压缩
+abort_ratio = 0.95            # 预算使用率 ≥ 95%：熔断，输出已有发现
+input_price_per_m = 2.2       # 输入单价（元 / 百万 token），用于成本估算（峰时价）
+output_price_per_m = 8.6      # 输出单价（元 / 百万 token）
 
 [review]
+languages = "auto"             # 审查语言：auto（按目录实际存在）/ python / java / "python,java"
 max_turns = 12                # ReAct 循环最大轮次
 active_window_turns = 4       # 记忆活跃区保留的最近轮数
 max_file_lines = 2000         # 超过则跳过（大文件预过滤）

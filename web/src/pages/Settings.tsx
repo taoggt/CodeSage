@@ -1,9 +1,11 @@
 import { useState } from "react";
+import type { ReactNode } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import clsx from "clsx";
 
 import { api } from "../api/client";
-import { useConfig, useHealth, useStats } from "../api/queries";
+import { useConfig, useHealth, useSaveConfig, useStats } from "../api/queries";
+import type { AppConfig } from "../api/types";
 import { useWorkspaceStore } from "../stores/workspace";
 
 export function Settings() {
@@ -36,8 +38,9 @@ export function Settings() {
       <div className="mx-auto max-w-4xl px-6 py-5">
         <h1 className="text-[14px] font-semibold">设置与自检</h1>
         <p className="mt-1 text-[11px] leading-relaxed text-ink-400">
-          这里是只读视图。修改配置请编辑项目根目录的 <code className="rounded bg-ink-100 px-1">codesage.toml</code> 或{" "}
-          <code className="rounded bg-ink-100 px-1">.env</code>，然后重启服务——不在网页里写密钥，避免把文件写坏。
+          模型与预算可以直接在这里改，保存后立即生效并写回{" "}
+          <code className="rounded bg-ink-100 px-1">codesage.toml</code>。
+          API Key 与监听端口不经过网页（避免写坏密钥、改端口需要重启）。
         </p>
 
         {notice && (
@@ -79,33 +82,13 @@ export function Settings() {
           </div>
         </section>
 
-        <section className="mt-5 grid gap-4 lg:grid-cols-2">
-          <div>
-            <h2 className="text-[12px] font-medium text-ink-700">LLM</h2>
-            <Table
-              rows={[
-                ["Base URL", String(config.data?.llm.base_url ?? "—")],
-                ["强模型", String(config.data?.llm.model_strong ?? "—")],
-                ["快模型", String(config.data?.llm.model_fast ?? "—")],
-                ["温度", String(config.data?.llm.temperature ?? "—")],
-                ["超时", `${config.data?.llm.timeout ?? "—"}s`],
-                ["API Key", config.data?.llm.configured ? "已配置（不显示）" : "未配置"],
-              ]}
-            />
-          </div>
-          <div>
-            <h2 className="text-[12px] font-medium text-ink-700">预算与压缩</h2>
-            <Table
-              rows={[
-                ["上下文窗口", String(config.data?.budget.context_window ?? "—")],
-                ["软阈值", `${Math.round((config.data?.budget.soft_ratio ?? 0) * 100)}%`],
-                ["硬阈值", `${Math.round((config.data?.budget.hard_ratio ?? 0) * 100)}%`],
-                ["熔断", `${Math.round((config.data?.budget.abort_ratio ?? 0) * 100)}%`],
-                ["最大轮次", String(config.data?.review.max_turns ?? "—")],
-                ["活跃窗口", `${config.data?.review.active_window_turns ?? "—"} 轮`],
-              ]}
-            />
-          </div>
+        <section className="mt-5">
+          <h2 className="text-[12px] font-medium text-ink-700">模型与预算</h2>
+          {config.data ? (
+            <ConfigForm config={config.data} />
+          ) : (
+            <p className="mt-1.5 text-[11px] text-ink-400">加载中…</p>
+          )}
         </section>
 
         <section className="mt-5">
@@ -179,17 +162,257 @@ function Status({ label, ok, text }: { label: string; ok: boolean; text: string 
   );
 }
 
-function Table({ rows }: { rows: [string, string][] }) {
+const INPUT_CLASS =
+  "w-36 rounded border border-ink-200 px-1.5 py-1 text-right font-mono text-[11px] text-ink-700 focus:border-ink-400 focus:outline-none disabled:bg-ink-50 disabled:text-ink-400";
+
+type ConfigFormState = {
+  model_strong: string;
+  model_fast: string;
+  max_output_tokens: number;
+  context_window: number;
+  budget_window: number;
+  max_turns: number;
+  languages: string;
+};
+
+function fromConfig(config: AppConfig): ConfigFormState {
+  return {
+    model_strong: config.llm.model_strong,
+    model_fast: config.llm.model_fast,
+    max_output_tokens: config.llm.max_output_tokens,
+    context_window: config.budget.context_window,
+    budget_window: config.budget.budget_window,
+    max_turns: Number(config.review.max_turns ?? 12),
+    languages: String(config.review.languages ?? "auto"),
+  };
+}
+
+function ConfigForm({ config }: { config: AppConfig }) {
+  const [form, setForm] = useState<ConfigFormState>(() => fromConfig(config));
+  const [notice, setNotice] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
+  const save = useSaveConfig();
+
+  const lockedSet = (section: string) => new Set(config.env_locked?.[section] ?? []);
+  const llmLocked = lockedSet("llm");
+  const budgetLocked = lockedSet("budget");
+  const reviewLocked = lockedSet("review");
+
+  const budgetWindow = Number(form.budget_window) || 0;
+  const softTokens = Math.round(budgetWindow * config.budget.soft_ratio);
+  const hardTokens = Math.round(budgetWindow * config.budget.hard_ratio);
+  const abortTokens = Math.round(budgetWindow * config.budget.abort_ratio);
+  const exceedsModel = budgetWindow > Number(form.context_window);
+
+  const setText = (key: "model_strong" | "model_fast" | "languages", value: string) =>
+    setForm((prev) => ({ ...prev, [key]: value }));
+  const setNum = (
+    key: "max_output_tokens" | "context_window" | "budget_window" | "max_turns",
+    value: string,
+  ) => setForm((prev) => ({ ...prev, [key]: Number(value) || 0 }));
+
+  function submit() {
+    setNotice(null);
+    const llm: Record<string, unknown> = {};
+    if (!llmLocked.has("model_strong")) llm.model_strong = form.model_strong.trim();
+    if (!llmLocked.has("model_fast")) llm.model_fast = form.model_fast.trim();
+    if (!llmLocked.has("max_output_tokens")) llm.max_output_tokens = form.max_output_tokens;
+
+    const budget: Record<string, unknown> = {};
+    if (!budgetLocked.has("context_window")) budget.context_window = form.context_window;
+    if (!budgetLocked.has("budget_window")) budget.budget_window = form.budget_window;
+
+    const review: Record<string, unknown> = {};
+    if (!reviewLocked.has("max_turns")) review.max_turns = form.max_turns;
+    if (!reviewLocked.has("languages")) review.languages = form.languages;
+
+    const payload: Record<string, unknown> = {};
+    if (Object.keys(llm).length) payload.llm = llm;
+    if (Object.keys(budget).length) payload.budget = budget;
+    if (Object.keys(review).length) payload.review = review;
+
+    if (!Object.keys(payload).length) {
+      setNotice({ kind: "err", text: "可改字段都被环境变量或 .env 固定了，请先改那边" });
+      return;
+    }
+
+    save.mutate(payload, {
+      onSuccess: (data) => {
+        setForm(fromConfig(data));
+        setNotice({ kind: "ok", text: "已保存并立即生效（无需重启）" });
+      },
+      onError: (error) => setNotice({ kind: "err", text: (error as Error).message }),
+    });
+  }
+
   return (
-    <table className="mt-1.5 w-full text-[10.5px]">
-      <tbody>
-        {rows.map(([key, value]) => (
-          <tr key={key} className="border-b border-ink-100">
-            <td className="py-1 text-ink-500">{key}</td>
-            <td className="py-1 text-right font-mono text-ink-700">{value}</td>
-          </tr>
-        ))}
-      </tbody>
-    </table>
+    <div className="mt-1.5 rounded border border-ink-200 bg-white p-3">
+      <div className="grid gap-x-6 gap-y-1 lg:grid-cols-2">
+        <div>
+          <Field
+            label="强模型"
+            hint={llmLocked.has("model_strong") ? "被环境变量固定" : "深度审查与最终总结"}
+            locked={llmLocked.has("model_strong")}
+          >
+            <input
+              value={form.model_strong}
+              disabled={llmLocked.has("model_strong")}
+              onChange={(event) => setText("model_strong", event.target.value)}
+              className={INPUT_CLASS}
+            />
+          </Field>
+          <Field
+            label="快模型"
+            hint={llmLocked.has("model_fast") ? "被环境变量固定" : "工具决策与摘要压缩"}
+            locked={llmLocked.has("model_fast")}
+          >
+            <input
+              value={form.model_fast}
+              disabled={llmLocked.has("model_fast")}
+              onChange={(event) => setText("model_fast", event.target.value)}
+              className={INPUT_CLASS}
+            />
+          </Field>
+          <Field
+            label="单次输出上限"
+            hint={llmLocked.has("max_output_tokens") ? "被环境变量固定" : "token，覆盖一份审查报告"}
+            locked={llmLocked.has("max_output_tokens")}
+          >
+            <input
+              type="number"
+              value={form.max_output_tokens}
+              disabled={llmLocked.has("max_output_tokens")}
+              onChange={(event) => setNum("max_output_tokens", event.target.value)}
+              className={INPUT_CLASS}
+            />
+          </Field>
+          <Field label="最大轮次" hint={reviewLocked.has("max_turns") ? "被环境变量固定" : "ReAct 循环上限"}>
+            <input
+              type="number"
+              value={form.max_turns}
+              disabled={reviewLocked.has("max_turns")}
+              onChange={(event) => setNum("max_turns", event.target.value)}
+              className={INPUT_CLASS}
+            />
+          </Field>
+          <Field
+            label="审查语言"
+            hint={
+              reviewLocked.has("languages")
+                ? "被环境变量固定"
+                : "auto：目录里有 .py 审 Python、有 .java 审 Java"
+            }
+            locked={reviewLocked.has("languages")}
+          >
+            <select
+              value={form.languages}
+              disabled={reviewLocked.has("languages")}
+              onChange={(event) => setText("languages", event.target.value)}
+              className={INPUT_CLASS}
+            >
+              <option value="auto">auto（自动探测）</option>
+              <option value="python">仅 Python</option>
+              <option value="java">仅 Java</option>
+              <option value="python,java">Python + Java</option>
+            </select>
+          </Field>
+        </div>
+
+        <div>
+          <Field
+            label="标称上下文窗口"
+            hint={budgetLocked.has("context_window") ? "被环境变量固定" : "模型上限，仅校验与展示"}
+            locked={budgetLocked.has("context_window")}
+          >
+            <input
+              type="number"
+              value={form.context_window}
+              disabled={budgetLocked.has("context_window")}
+              onChange={(event) => setNum("context_window", event.target.value)}
+              className={INPUT_CLASS}
+            />
+          </Field>
+          <Field
+            label="工作预算"
+            hint={budgetLocked.has("budget_window") ? "被环境变量固定" : "三区阈值按这个算，不是标称窗口"}
+            locked={budgetLocked.has("budget_window")}
+          >
+            <input
+              type="number"
+              value={form.budget_window}
+              disabled={budgetLocked.has("budget_window")}
+              onChange={(event) => setNum("budget_window", event.target.value)}
+              className={INPUT_CLASS}
+            />
+          </Field>
+          <Field label="触发点" hint="按当前比例换算成 token">
+            <span className="font-mono text-[10.5px] text-ink-500">
+              {softTokens.toLocaleString()} / {hardTokens.toLocaleString()} / {abortTokens.toLocaleString()}
+            </span>
+          </Field>
+          <Field label="API Key" hint="不经过网页，请改 .env">
+            <span className="text-[10.5px] text-ink-500">
+              {config.llm.configured ? "已配置" : "未配置"}
+            </span>
+          </Field>
+        </div>
+      </div>
+
+      {exceedsModel && (
+        <p className="mt-2 rounded bg-amber-50 px-2 py-1 text-[10.5px] text-amber-700">
+          工作预算超过标称窗口，实际按标称值生效。
+        </p>
+      )}
+
+      <div className="mt-3 flex items-center gap-2">
+        <button
+          type="button"
+          onClick={submit}
+          disabled={save.isPending}
+          className="rounded bg-ink-900 px-3 py-1 text-[11px] text-white hover:bg-ink-800 disabled:opacity-50"
+        >
+          {save.isPending ? "保存中…" : "保存配置"}
+        </button>
+        {notice && (
+          <span
+            className={clsx(
+              "text-[10.5px]",
+              notice.kind === "ok" ? "text-emerald-600" : "text-red-600",
+            )}
+          >
+            {notice.text}
+          </span>
+        )}
+      </div>
+
+      <p className="mt-2 text-[9.5px] leading-relaxed text-ink-400">
+        写回文件：{config.config_file}。保存会重写该文件，自定义注释不保留；
+        被环境变量或 .env 固定的字段不会提交，避免“改了没反应、重启又变回去”。
+      </p>
+    </div>
+  );
+}
+
+function Field({
+  label,
+  hint,
+  locked,
+  children,
+}: {
+  label: string;
+  hint?: string;
+  locked?: boolean;
+  children: ReactNode;
+}) {
+  return (
+    <div className="flex items-center justify-between gap-3 border-b border-ink-100 py-1.5">
+      <div className="min-w-0">
+        <div className={clsx("text-[10.5px]", locked ? "text-ink-400" : "text-ink-600")}>
+          {label}
+          {locked && " · 锁定"}
+        </div>
+        {hint && <div className="truncate text-[9.5px] text-ink-400">{hint}</div>}
+      </div>
+      {children}
+    </div>
   );
 }

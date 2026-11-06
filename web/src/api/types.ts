@@ -87,7 +87,10 @@ export interface TreeEntry {
   name: string;
   type: "dir" | "file";
   has_children?: boolean;
+  /** @deprecated 用 language 判断（保留字段仅为兼容旧响应） */
   is_python?: boolean;
+  /** 语言代码：python / java / typescript…（由后端语言注册表生成） */
+  language?: string;
   size?: number;
 }
 
@@ -234,12 +237,43 @@ export interface Health {
   analyzers: { name: string; available: boolean }[];
 }
 
+export interface LlmConfig {
+  base_url: string;
+  model_strong: string;
+  model_fast: string;
+  temperature: number;
+  max_output_tokens: number;
+  timeout: number;
+  configured: boolean;
+}
+
+export interface BudgetConfig {
+  /** 模型标称上下文上限，只用于展示与校验 */
+  context_window: number;
+  /** 单次审查的工作预算，三区阈值以它为分母 */
+  budget_window: number;
+  effective_budget_window: number;
+  soft_ratio: number;
+  hard_ratio: number;
+  abort_ratio: number;
+  input_price_per_m: number;
+  output_price_per_m: number;
+}
+
 export interface AppConfig {
-  llm: Record<string, any>;
-  budget: Record<string, any>;
+  llm: LlmConfig;
+  budget: BudgetConfig;
   review: Record<string, any>;
   server: Record<string, any>;
-  store_path: string;
+  /** 当前生效的 codesage.toml 绝对路径 */
+  config_file: string;
+  /** 允许在设置页修改的字段白名单，按段分组 */
+  editable: Record<string, string[]>;
+  /** 被环境变量或 .env 固定、写入无效的字段 */
+  env_locked: Record<string, string[]>;
+  /** 按当前模型推导的标称窗口，用于换模型后的建议值 */
+  suggested_context_window: number;
+  store_path?: string;
 }
 
 export interface StatsOverview {

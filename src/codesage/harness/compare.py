@@ -3,7 +3,7 @@
 典型用途：
 - prompt 修改前后（结合 optim/prompts 的版本号）
 - 错题本注入前后（验证自优化是否真的有效）
-- 不同模型对比（deepseek-chat vs reasoner 的成本-质量曲线）
+- 不同模型对比（deepseek-flash vs deepseek-v4-pro 的成本-质量曲线）
 - 压缩阈值参数对比（60/80 vs 70/90 的取舍数据）
 
 对比原则（面试要点）：同一数据集、同一模型、同一参数——

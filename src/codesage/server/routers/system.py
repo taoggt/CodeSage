@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import shutil
 from pathlib import Path
+from typing import Any
 
 from fastapi import APIRouter
 
 import codesage
-from codesage.analyzers import default_analyzers
+from codesage.analyzers import default_analyzers, default_rule_engines
+from codesage.core.languages import all_specs
 from codesage.server.deps import SettingsDep, StoreDep
+from codesage.services.config_service import config_view, save_config
 from codesage.services.store_factory import resolve_store_path, store_available
 from codesage.services.workspace_service import analyzer_readiness
 
@@ -33,7 +36,12 @@ def _static_built() -> bool:
 @router.get("/health")
 def health(settings: SettingsDep) -> dict:
     analyzers = [
-        {"name": a.name, "available": bool(a.is_available())} for a in default_analyzers()
+        {"name": engine.name, "available": bool(engine.is_available()), "kind": "rule"}
+        for engine in default_rule_engines()
+    ]
+    analyzers += [
+        {"name": a.name, "available": bool(a.is_available()), "kind": "tool"}
+        for a in default_analyzers()
     ]
     return {
         "status": "ok",
@@ -67,10 +75,21 @@ def meta() -> dict:
         ],
         "sources": [
             {"name": "ast_rule", "zh": "自研规则"},
+            {"name": "java_rule", "zh": "Java 规则"},
             {"name": "ruff", "zh": "Ruff"},
             {"name": "bandit", "zh": "Bandit"},
             {"name": "radon", "zh": "radon"},
             {"name": "llm", "zh": "LLM 推理"},
+        ],
+        # 语言清单由注册表生成：新增语言不需要改这个文件
+        "languages": [
+            {
+                "code": spec.code,
+                "display": spec.display,
+                "extensions": list(spec.extensions),
+                "fence": spec.markdown_fence,
+            }
+            for spec in all_specs()
         ],
         "verdicts": [
             {"name": "wrong", "zh": "误报"},
@@ -84,36 +103,18 @@ def meta() -> dict:
 @router.get("/config")
 def config(settings: SettingsDep) -> dict:
     """白名单序列化：永不返回 api_key（只返回是否已配置）。"""
-    return {
-        "llm": {
-            "base_url": settings.llm.base_url,
-            "model_strong": settings.llm.model_strong,
-            "model_fast": settings.llm.model_fast,
-            "temperature": settings.llm.temperature,
-            "max_output_tokens": settings.llm.max_output_tokens,
-            "timeout": settings.llm.timeout,
-            "configured": settings.llm_configured,
-        },
-        "budget": {
-            "context_window": settings.budget.context_window,
-            "soft_ratio": settings.budget.soft_ratio,
-            "hard_ratio": settings.budget.hard_ratio,
-            "abort_ratio": settings.budget.abort_ratio,
-        },
-        "review": {
-            "max_turns": settings.review.max_turns,
-            "active_window_turns": settings.review.active_window_turns,
-            "max_file_lines": settings.review.max_file_lines,
-            "ignore_dirs": settings.review.ignore_dirs,
-        },
-        "server": {
-            "host": settings.server.host,
-            "port": settings.server.port,
-            "max_review_jobs": settings.server.max_review_jobs,
-            "max_eval_jobs": settings.server.max_eval_jobs,
-        },
-        "store_path": str(resolve_store_path(settings)),
-    }
+    return config_view(settings, str(resolve_store_path(settings)))
+
+
+@router.put("/config")
+def update_config(payload: dict[str, Any], settings: SettingsDep) -> dict:
+    """保存设置页提交的白名单字段：写回 codesage.toml 并热更新运行中的配置。
+
+    只允许改 llm / budget / review 三段的白名单字段；
+    密钥与 server 段（改端口、并发要重启）不在其中。
+    """
+    save_config(settings, payload)
+    return config_view(settings, str(resolve_store_path(settings)))
 
 
 @router.get("/stats")

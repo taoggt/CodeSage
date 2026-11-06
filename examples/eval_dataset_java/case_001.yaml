@@ -1,0 +1,8 @@
+id: case_001
+category: bug
+description: 空 catch 块 - 异常被静默吞没（对应 JG001）
+snippet: snippets/case_001.java
+ground_truth:
+  line_range: [5, 6]
+  severity: major
+  keywords: ["空 catch", "静默", "catch"]

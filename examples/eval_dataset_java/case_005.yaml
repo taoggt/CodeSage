@@ -1,0 +1,8 @@
+id: case_005
+category: security
+description: SQL 注入 - 用户输入被拼进查询语句（对应 JG005）
+snippet: snippets/case_005.java
+ground_truth:
+  line_range: [10, 10]
+  severity: major
+  keywords: ["SQL", "拼接", "executeQuery"]

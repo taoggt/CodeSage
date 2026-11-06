@@ -1,0 +1,8 @@
+id: case_003
+category: security
+description: 命令注入 - Runtime.exec 接收拼接后的外部参数（对应 JG003）
+snippet: snippets/case_003.java
+ground_truth:
+  line_range: [4, 5]
+  severity: major
+  keywords: ["命令注入", "exec", "命令执行"]

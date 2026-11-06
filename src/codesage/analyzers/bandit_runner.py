@@ -24,6 +24,7 @@ from codesage.analyzers.base import (
     run_command,
     tool_exists,
 )
+from codesage.core.languages import Language
 from codesage.core.models import Category, Finding, Severity, Source
 
 _SEVERITY_MAP = {
@@ -71,6 +72,8 @@ class BanditAnalyzer(Analyzer):
     name = "bandit"
     display = "Bandit（安全扫描）"
     supports_batch = True
+    # Bandit 只解析 Python（规则号 B3xx 全是 Python 生态语义）
+    languages = (Language.PYTHON,)
 
     # 直扫真实目录时必须排除的目录（否则会递归进 .venv 等依赖目录）
     _EXCLUDE_GLOBS = (

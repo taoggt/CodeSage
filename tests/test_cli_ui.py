@@ -55,3 +55,15 @@ def test_origin_allows_localhost(client, workspace) -> None:
         headers={"origin": "http://127.0.0.1:8787"},
     )
     assert response.status_code == 200
+
+
+def test_review_language_option_is_registered() -> None:
+    """--language 必须出现在帮助里，且非法值直接退出码 2（不静默按 auto 跑）。"""
+    result = CliRunner().invoke(app, ["review", "--help"])
+    assert result.exit_code == 0
+    assert "--language" in result.stdout
+    assert "auto" in result.stdout
+
+    bad = CliRunner().invoke(app, ["review", ".", "--language", "kotlin", "--no-llm"])
+    assert bad.exit_code == 2
+    assert "kotlin" in bad.stdout

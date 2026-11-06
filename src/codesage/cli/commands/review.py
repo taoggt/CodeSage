@@ -11,6 +11,7 @@ from rich.console import Console
 from codesage.cli.exporter import export_report, to_json, to_markdown
 from codesage.cli.render import render_report, render_skipped
 from codesage.core.config import load_settings
+from codesage.core.languages import parse_language_mode
 from codesage.core.models import ReviewReport, Severity
 from codesage.pipeline import ReviewOptions, run_review
 
@@ -77,6 +78,9 @@ def _make_progress_printer():
             )
         elif event == "changed_fallback":
             console.print(f"[yellow]› {payload['reason']}[/yellow]")
+        elif event == "language_degraded":
+            for language, hint in (payload or {}).items():
+                console.print(f"[yellow]› {language}：{hint}[/yellow]")
         elif event == "context" and payload.get("state") in ("hard", "abort"):
             console.print(
                 f"[yellow]› 上下文 {payload['tokens']} tokens"
@@ -103,6 +107,12 @@ def review(
     changed: bool = typer.Option(
         False, "--changed", help="只审查 git 变更涉及的文件（增量模式，对比 HEAD）"
     ),
+    language: Optional[str] = typer.Option(
+        None,
+        "--language",
+        "-L",
+        help="审查语言范围：auto（默认，按目录实际存在）/ python / java / python,java",
+    ),
     max_turns: Optional[int] = typer.Option(
         None, "--max-turns", help="覆盖 LLM 循环的最大轮次（默认取配置值）"
     ),
@@ -120,7 +130,7 @@ def review(
         "可选值：none/critical(P0)/major(P1)/minor(P2)/info(P3)",
     ),
 ) -> None:
-    """审查指定路径的 Python 代码（确定性分析 + 可选 LLM）。
+    """审查指定路径的代码（确定性分析 + 可选 LLM）。
 
     示例:
       codesage review src/                 # 完整审查（LLM + 确定性分析）
@@ -129,6 +139,7 @@ def review(
       codesage review . --min-severity P1  # 只看 P1 及以上（major 的别名）
       codesage review a.py --format json -o report.json    # 导出 JSON 报告
       codesage review . --fail-on major    # CI：有重要问题则退出码 1
+      codesage review . --language java    # 只审 Java（默认 auto：有 .java 就审）
     """
     threshold = _parse_severity(min_severity)
     if threshold is None:
@@ -148,6 +159,14 @@ def review(
             raise typer.Exit(2)
 
     settings = load_settings()
+
+    if language is not None:
+        try:
+            parse_language_mode(language)
+        except ValueError as exc:
+            console.print(f"[red]非法 --language：{exc}[/red]")
+            raise typer.Exit(2) from exc
+
     if not no_llm and not settings.llm_configured and not quiet:
         console.print(
             "[yellow]未检测到 API Key，将降级为确定性分析。[/yellow]"
@@ -160,6 +179,7 @@ def review(
         changed_only=changed,
         quiet=quiet,
         max_turns=max_turns,
+        languages=language,
         on_event=None if quiet else _make_progress_printer(),
     )
 
@@ -168,6 +188,17 @@ def review(
     except (FileNotFoundError, ValueError) as exc:
         console.print(f"[red]错误：{exc}[/red]")
         raise typer.Exit(2) from exc
+
+    # 降级必须显式告知：确定性层缺失 + 没用 LLM 时，这些语言等于"没被检查"，
+    # 而报告会显示"无问题"——这是比误报更危险的静默失效。
+    degraded = report.metadata.get("language_degraded") or {}
+    if degraded and no_llm and not quiet:
+        console.print(
+            "[bold yellow]注意：以下语言的确定性分析不可用，且本次未启用 LLM，"
+            "相关文件实际上未被检查。[/bold yellow]"
+        )
+        for language_name, hint in degraded.items():
+            console.print(f"[yellow]  · {language_name}：{hint}[/yellow]")
 
     # ---- 输出
     if fmt == "terminal":

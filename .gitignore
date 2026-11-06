@@ -8,6 +8,7 @@ dist/
 # 虚拟环境
 .venv/
 venv/
+QuickBootWithVenv.lnk
 
 # 工具缓存
 .pytest_cache/

@@ -28,6 +28,7 @@ class ReviewRequest:
     changed_only: bool = False
     max_turns: int | None = None
     keep_partial: bool = True
+    languages: str | None = None
 
 
 def run(
@@ -52,6 +53,7 @@ def run(
         changed_only=request.changed_only,
         quiet=True,
         max_turns=request.max_turns,
+        languages=request.languages,
         on_event=on_event,
         cancel_token=cancel_token,
         persist=True,

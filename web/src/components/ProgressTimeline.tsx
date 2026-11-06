@@ -1,10 +1,11 @@
 import clsx from "clsx";
 
+import { useConfig } from "../api/queries";
 import { useJobStore } from "../stores/job";
 
 const PHASES = [
   { key: "scan", label: "扫描", hint: "收集文件、应用过滤" },
-  { key: "static", label: "确定性分析", hint: "AST 规则 + Ruff/Bandit/radon" },
+  { key: "static", label: "确定性分析", hint: "自研规则 + 外部工具（按语言）" },
   { key: "llm", label: "ReAct 循环", hint: "LLM 复核候选 + 补充发现" },
   { key: "merge", label: "合并去重", hint: "驳回误报、跨来源合并" },
   { key: "persist", label: "落盘", hint: "写入历史记录" },
@@ -68,8 +69,13 @@ export function ProgressTimeline() {
 
 export function TokenGauge() {
   const counters = useJobStore((state) => state.counters);
+  const config = useConfig();
   const used = counters.tokens || 0;
-  const window = 64000;
+  // 分母是工作预算，不是模型标称窗口——两者可能差一个数量级
+  const budget = config.data?.budget;
+  const window = budget?.effective_budget_window || 120_000;
+  const soft = budget?.soft_ratio ?? 0.6;
+  const hard = budget?.hard_ratio ?? 0.8;
   const ratio = Math.min(1, used / window);
 
   return (
@@ -84,17 +90,21 @@ export function TokenGauge() {
         <div
           className={clsx(
             "h-full rounded-full transition-all",
-            ratio >= 0.95 ? "bg-red-500" : ratio >= 0.8 ? "bg-orange-500" : "bg-blue-500",
+            ratio >= (budget?.abort_ratio ?? 0.95)
+              ? "bg-red-500"
+              : ratio >= hard
+                ? "bg-orange-500"
+                : "bg-blue-500",
           )}
           style={{ width: `${Math.max(2, ratio * 100)}%` }}
         />
-        <span className="absolute inset-y-0 left-[60%] w-px bg-white/70" />
-        <span className="absolute inset-y-0 left-[80%] w-px bg-white/70" />
+        <span className="absolute inset-y-0 w-px bg-white/70" style={{ left: `${soft * 100}%` }} />
+        <span className="absolute inset-y-0 w-px bg-white/70" style={{ left: `${hard * 100}%` }} />
       </div>
       <div className="mt-1 flex justify-between text-[9.5px] text-ink-400">
-        <span>60% 软压缩</span>
-        <span>80% 强制压缩</span>
-        <span>95% 熔断</span>
+        <span>{Math.round(soft * 100)}% 软压缩</span>
+        <span>{Math.round(hard * 100)}% 强制压缩</span>
+        <span>{Math.round((budget?.abort_ratio ?? 0.95) * 100)}% 熔断</span>
       </div>
     </div>
   );

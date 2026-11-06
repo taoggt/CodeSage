@@ -38,6 +38,7 @@ def create_job(
         changed_only=payload.changed_only,
         max_turns=payload.max_turns,
         keep_partial=payload.keep_partial,
+        languages=payload.languages,
     )
     job = jobs.submit_review(request, registry)
     return {"job_id": job.id, "status": job.status}

@@ -1,0 +1,8 @@
+id: case_004
+category: security
+description: 硬编码凭据 - 密钥字面量写在源码里（对应 JG004）
+snippet: snippets/case_004.java
+ground_truth:
+  line_range: [3, 3]
+  severity: major
+  keywords: ["硬编码", "凭据", "apiKey"]

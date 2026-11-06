@@ -1,0 +1,8 @@
+id: case_008
+category: bug
+description: 契约破坏 - 重写 equals 但未重写 hashCode（对应 JG009）
+snippet: snippets/case_008.java
+ground_truth:
+  line_range: [11, 11]
+  severity: minor
+  keywords: ["equals", "hashCode", "契约"]

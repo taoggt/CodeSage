@@ -27,6 +27,18 @@ export const useHealth = () =>
 
 export const useConfig = () => useQuery({ queryKey: ["config"], queryFn: () => api<AppConfig>("/config") });
 
+export const useSaveConfig = () => {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (patch: Record<string, unknown>) =>
+      api<AppConfig>("/config", { method: "PUT", body: JSON.stringify(patch) }),
+    onSuccess: (data) => {
+      // 后端已热更新，直接把新配置写回缓存，不必再拉一次
+      queryClient.setQueryData(["config"], data);
+    },
+  });
+};
+
 export const useStats = () =>
   useQuery({ queryKey: ["stats"], queryFn: () => api<StatsOverview>("/stats") });
 

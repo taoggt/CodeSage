@@ -77,6 +77,89 @@ def test_different_categories_not_merged():
     assert len(dedup_findings([bug, security])) == 2
 
 
+def test_finding_language_roundtrip():
+    """language 字段必须进 to_dict / from_dict：报告导出与历史页都读它。"""
+    finding = Finding(
+        file="src/main/java/Foo.java",
+        line_start=3,
+        line_end=3,
+        category=Category.BUG,
+        severity=Severity.MAJOR,
+        title="空 catch",
+        source=Source.JAVA_RULE,
+        rule_id="JG001",
+        language="java",
+    )
+    payload = finding.to_dict()
+    assert payload["language"] == "java"
+    assert payload["source"] == "java_rule"
+
+    restored = Finding.from_dict(payload)
+    assert restored.language == "java"
+    assert restored.source is Source.JAVA_RULE
+
+
+def test_finding_language_inferred_from_path():
+    """LLM 提交的发现不会填 language——按文件后缀推断，导出围栏才正确。"""
+    finding = Finding(
+        file="src/App.java",
+        line_start=1,
+        line_end=1,
+        category=Category.BUG,
+        severity=Severity.MINOR,
+        title="x",
+    )
+    assert finding.language == ""
+    assert finding.language_code == "java"
+
+    # 完全无法判断时回退 python（历史 payload 没有该字段，不能崩）
+    unknown = Finding(
+        file="Makefile",
+        line_start=1,
+        line_end=1,
+        category=Category.QUALITY,
+        severity=Severity.INFO,
+        title="x",
+    )
+    assert unknown.language_code == "python"
+
+
+def test_unknown_source_is_tolerated():
+    """旧版本读到新版本写入的来源时降级，而不是抛 ValueError 让历史页白屏。"""
+    payload = {
+        "file": "a.java",
+        "line_start": 1,
+        "category": "bug",
+        "severity": "major",
+        "title": "x",
+        "source": "checkstyle",  # 尚未注册的未来来源
+    }
+    finding = Finding.from_dict(payload)
+    assert finding.source is Source.AST_RULE
+    assert finding.language == "java"
+
+
+def test_enum_chinese_labels_never_raise():
+    """枚举是增量扩展的：新增值漏配中文名应退化为英文值，不能 KeyError。"""
+    for severity in Severity:
+        assert severity.zh
+        assert severity.label.startswith("P")
+    for category in Category:
+        assert category.zh
+    for source in Source:
+        assert source.zh
+    assert Source.JAVA_RULE.zh == "Java 规则"
+
+
+def test_java_rule_dedup_priority_ties_with_ast_rule():
+    """两种自研规则同级：语言互斥，不会真正撞在同一行上。"""
+    java = make(Source.JAVA_RULE)
+    bandit = make(Source.BANDIT)
+    result = dedup_findings([bandit, java])
+    assert len(result) == 1
+    assert result[0].source is Source.JAVA_RULE
+
+
 def test_report_to_dict_from_dict_roundtrip():
     """报告序列化往返：历史详情渲染依赖 from_dict 的完整性。"""
     from codesage.core.models import ReviewReport, TokenUsage

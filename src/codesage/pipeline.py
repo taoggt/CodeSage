@@ -28,11 +28,19 @@ from codesage.agent.context import build_task_brief
 from codesage.agent.loop import AgentLoop, LoopConfig
 from codesage.agent.policies import StopPolicy
 from codesage.agent.profiles import build_system_prompt
-from codesage.analyzers import RuleEngine, default_analyzers
+from codesage.analyzers import default_analyzers, default_rule_engines
 from codesage.core.cancel import CancelToken
 from codesage.core.config import Settings, load_settings
+from codesage.core.languages import (
+    AUTO_MODE,
+    Language,
+    describe_languages,
+    extensions_label,
+    language_for_path,
+    parse_language_mode,
+)
 from codesage.core.models import Finding, ReviewReport, TokenUsage, dedup_findings
-from codesage.ingest.filters import FileFilter
+from codesage.ingest.filters import FileFilter, SkipReason, default_excludes_for
 from codesage.ingest.scanner import count_lines, scan
 from codesage.knowledge import default_knowledge_base
 from codesage.llm.budget import TokenBudget
@@ -59,6 +67,9 @@ class ReviewOptions:
     quiet: bool = False
     max_turns: int | None = None
     on_event: EventHook | None = None
+    # 语言范围："auto"（默认，按目录里实际存在的语言）或 "python" / "java" /
+    # "python,java"。None 表示沿用配置值（配置默认 auto）。
+    languages: str | None = None
     # ---- GUI / 评测相关（默认值保证 CLI 行为不变）
     cancel_token: CancelToken | None = None
     persist: bool = True
@@ -110,13 +121,21 @@ def run_review(
 
     # ---------------------------------------------------------- 1. 扫描
     _emit(options, "phase", {"name": "scan", "index": 1, "total": len(PHASES)})
+    language_mode, mode_languages = parse_language_mode(
+        options.languages if options.languages is not None else settings.review.languages
+    )
     file_filter = FileFilter(
         workspace,
         excludes=list(settings.review.ignore_dirs),
         max_file_lines=settings.review.max_file_lines,
+        languages=mode_languages,
+        extra_excludes=default_excludes_for(mode_languages),
     )
     scan_result = scan(target, file_filter)
     files = scan_result.files
+    # auto 模式的"探测"就发生在这里：扫描结果自带按语言的计数，
+    # 不需要为了探测语言再遍历一遍目录。
+    detected_languages = dict(scan_result.language_counts)
 
     # --changed：只保留 git 变更涉及的文件（增量审查）
     # 边界语义：非 git 仓库 → 回退全量并提示；仓库但无变更 → 明确报错
@@ -141,13 +160,13 @@ def run_review(
             files = [f for f in files if f.resolve() in changed_files]
             if not files:
                 raise ValueError(
-                    f"变更的 {len(changed_files)} 个文件中没有可审查的 Python 文件。"
+                    f"变更的 {len(changed_files)} 个文件中没有可审查的代码文件"
+                    f"（本次语言范围：{describe_languages(mode_languages)}）。"
                 )
 
     if not files:
         raise ValueError(
-            f"没有可审查的 Python 文件（{target}）。"
-            f"跳过 {len(scan_result.skipped)} 个候选。"
+            _no_files_message(target, language_mode, mode_languages, scan_result)
         )
 
     _emit(options, "scan", {"files": len(files), "skipped": len(scan_result.skipped)})
@@ -157,8 +176,7 @@ def run_review(
     # ---------------------------------------------------------- 2. 确定性分析
     _emit(options, "phase", {"name": "static", "index": 2, "total": len(PHASES)})
     det_findings: list[Finding] = []
-    engine = RuleEngine()
-    analyzers = [a for a in default_analyzers() if a.is_available()]
+    degraded: dict[str, str] = {}
     file_inventory: list[tuple[str, int]] = []
 
     # 一次读取全部源码（多处复用）
@@ -174,31 +192,66 @@ def run_review(
         file_inventory.append((rel, count_lines(file_path)))
         sources.append((rel, source))
 
+    # 按语言分组：每个引擎/分析器只接触自己语言的文件。
+    # 这是"混合仓库"能正确工作的关键——不做分组的话，Java 源码会被送进
+    # ast.parse / ruff，产出的是噪音而不是发现。
+    grouped: dict[Language, list[tuple[str, str]]] = {}
+    for rel, source in sources:
+        language = language_for_path(rel)
+        if language is None:
+            continue
+        grouped.setdefault(language, []).append((rel, source))
+
+    # 分析器按"本次实际出现的语言"筛选（而不是按配置），避免装了 Java 工具
+    # 却在一个纯 Python 仓库里也去跑它。is_available 失败的不进列表——
+    # 与 v1 "工具缺失就静默跳过"的语义一致。
+    analyzers = [
+        analyzer
+        for analyzer in default_analyzers(list(grouped))
+        if analyzer.is_available()
+    ]
+
     # 自研规则引擎（零 Token，逐文件遍历）
     total_sources = max(1, len(sources))
-    for index, (rel, source) in enumerate(sources, start=1):
-        if is_cancelled():
-            return cancelled_report("static")
-        det_findings.extend(engine.run(rel, source))
-        if index % 20 == 0 or index == total_sources:
-            _emit(
-                options,
-                "progress",
-                {"phase": "static", "done": index, "total": total_sources},
-            )
+    processed = 0
+    for engine in default_rule_engines():
+        if not engine.supports_any(grouped):
+            continue
+        if not engine.is_available():
+            # 降级不静默：确定性层缺失时用户必须知道"这份报告只做了半件事"
+            hint = getattr(engine, "unavailable_hint", "")
+            degraded[engine.language.value] = hint or f"{engine.name} 不可用"
+            continue
+        for rel, source in grouped.get(engine.language, []):
+            if is_cancelled():
+                return cancelled_report("static")
+            processed += 1
+            det_findings.extend(engine.run(rel, source))
+            if processed % 20 == 0 or processed == total_sources:
+                _emit(
+                    options,
+                    "progress",
+                    {"phase": "static", "done": processed, "total": total_sources},
+                )
 
     # 外部分析器：支持批量的走单次子进程调用（大仓库性能关键路径）
     # 传入 base_dir 让分析器直接扫描真实目录（避免临时目录的写删开销）
     for analyzer in analyzers:
-        if is_cancelled():
-            return cancelled_report("static")
-        if getattr(analyzer, "supports_batch", False):
-            batch = analyzer.run_batch(sources, base_dir=workspace)
-            for findings in batch.values():
-                det_findings.extend(findings)
-        else:
-            for rel, source in sources:
-                det_findings.extend(analyzer.run(rel, source))
+        for language, items in grouped.items():
+            if not items or not analyzer.supports(language):
+                continue
+            if is_cancelled():
+                return cancelled_report("static")
+            if getattr(analyzer, "supports_batch", False):
+                batch = analyzer.run_batch(items, base_dir=workspace)
+                for findings in batch.values():
+                    det_findings.extend(findings)
+            else:
+                for rel, source in items:
+                    det_findings.extend(analyzer.run(rel, source))
+
+    if degraded:
+        _emit(options, "language_degraded", degraded)
 
     _emit(
         options,
@@ -257,6 +310,7 @@ def run_review(
                 budget_hint=(
                     f"最多可执行 {settings.review.max_turns} 轮工具调用，请合理分配。"
                 ),
+                languages=list(grouped),
             )
             brief = build_task_brief(
                 target=str(target),
@@ -264,6 +318,7 @@ def run_review(
                 candidates=det_findings,
                 max_candidates=settings.review.max_candidates_in_prompt,
                 changed_only=options.changed_only,
+                languages=detected_languages,
             )
 
             compressor = _make_compressor(client, router, budget)
@@ -314,6 +369,11 @@ def run_review(
             "llm_findings": len(llm_findings),
             "dismissed": dismissed,
             "analyzers": [a.name for a in analyzers],
+            # ---- 多语言（只增字段，老 GUI 忽略即可）
+            "language_mode": language_mode,
+            "languages": detected_languages,
+            "language_degraded": degraded,
+            "scan_skip_counts": dict(scan_result.skip_counts),
             "scan_skipped": [
                 {"file": f, "reason": r} for f, r in scan_result.skipped[:20]
             ],
@@ -380,6 +440,27 @@ def run_review(
 
 
 # ---------------------------------------------------------------- 内部工具
+
+
+def _no_files_message(
+    target: Path,
+    language_mode: str,
+    languages: tuple[Language, ...],
+    scan_result,
+) -> str:
+    """空文件集的报错文案（三态，避免"只支持 Python"的旧措辞误导）。"""
+    supported = extensions_label(languages) or "受支持后缀"
+    quiet = scan_result.skip_counts.get(SkipReason.UNSUPPORTED_LANGUAGE.value, 0)
+    tail = f"跳过 {len(scan_result.skipped)} 个候选"
+    if quiet:
+        tail += f"，另有 {quiet} 个非目标语言文件"
+
+    if language_mode == AUTO_MODE:
+        return f"没有可审查的文件（{target}）：未发现 {supported} 文件（{tail}）。"
+    return (
+        f"没有可审查的 {describe_languages(languages)} 文件（{target}）："
+        f"已限定语言为 {language_mode}，但目录中没有 {supported} 文件（{tail}）。"
+    )
 
 
 def _done_payload(report: ReviewReport, cancelled: bool = False) -> dict[str, Any]:

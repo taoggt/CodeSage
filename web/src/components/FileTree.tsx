@@ -136,7 +136,7 @@ export function FileTree({ root, coverage, current, onSelect }: Props) {
         />
       ))}
       {entries.length === 0 && (
-        <div className="p-4 text-xs text-ink-400">没有可显示的 Python 文件</div>
+        <div className="p-4 text-xs text-ink-400">没有可显示的源码文件</div>
       )}
     </div>
   );

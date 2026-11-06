@@ -19,6 +19,7 @@ from pathlib import Path
 import yaml
 
 from codesage.core.errors import HarnessError
+from codesage.core.languages import all_extensions
 
 
 @dataclass
@@ -59,6 +60,13 @@ def load_dataset(dataset_dir: Path) -> list[EvalCase]:
         snippet_path = (dataset_dir / snippet_rel).resolve()
         if not snippet_path.is_file():
             raise HarnessError(f"案例的代码片段不存在：{path.name} → {snippet_rel}")
+        # 后缀必须在语言注册表里：否则 run_review 会因"没有可审查的文件"直接抛错，
+        # 表现为整批评测崩掉而不是"某案例 0 分"——那种失败很难定位。
+        if snippet_path.suffix.lower() not in set(all_extensions()):
+            raise HarnessError(
+                f"案例片段后缀不受支持：{path.name} → {snippet_rel}"
+                f"（已注册语言：{' / '.join(all_extensions())}）"
+            )
 
         gt = data.get("ground_truth") or {}
         line_range = gt.get("line_range") or [1, 1]

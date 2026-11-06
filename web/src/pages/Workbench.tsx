@@ -295,6 +295,7 @@ export function Workbench() {
                 findings={decorations}
                 activeId={activeId}
                 onSelectLine={handleLineClick}
+                language={file.data.language}
                 placeholder="从左侧选择文件查看源码"
               />
             ) : (

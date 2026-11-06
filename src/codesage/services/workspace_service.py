@@ -17,7 +17,8 @@ from pathlib import Path
 from typing import Any
 
 from codesage.core.config import Settings
-from codesage.ingest.filters import FileFilter
+from codesage.core.languages import all_extensions, language_spec_for_path, parse_language_mode
+from codesage.ingest.filters import FileFilter, default_excludes_for
 from codesage.ingest.git_diff import changed_line_ranges, is_git_repo
 from codesage.ingest.scanner import count_lines, scan
 from codesage.memory.store import Store
@@ -27,10 +28,22 @@ MAX_FILE_BYTES = 1_500_000
 MAX_TREE_ENTRIES = 2000
 MAX_LISTED_FILES = 500
 
-ALLOWED_SUFFIXES = {
-    ".py", ".pyi", ".md", ".txt", ".toml", ".yaml", ".yml", ".json",
-    ".cfg", ".ini", ".js", ".jsx", ".ts", ".tsx", ".css", ".html",
-    ".sql", ".sh", ".bat", ".ps1", ".java", ".go", ".rs",
+# 可预览 ≠ 可审查：下面这些类型 GUI 能展示（高亮/文本），但没有对应的审查器。
+# 可审查的语言后缀由 core.languages 注册表提供，避免两处手写清单漂移。
+_PREVIEW_EXTRA_SUFFIXES = {
+    ".pyi", ".md", ".txt", ".toml", ".yaml", ".yml", ".json", ".cfg", ".ini",
+    ".js", ".jsx", ".ts", ".tsx", ".css", ".html", ".sql", ".sh", ".bat",
+    ".ps1", ".go", ".rs",
+}
+ALLOWED_SUFFIXES = set(_PREVIEW_EXTRA_SUFFIXES) | set(all_extensions())
+
+# 仅用于语法高亮的展示名（注册表优先，这里是"注册表里没有"的补充）
+_PREVIEW_LANGUAGES = {
+    ".pyi": "python", ".ts": "typescript", ".tsx": "tsx",
+    ".js": "javascript", ".jsx": "jsx", ".json": "json", ".md": "markdown",
+    ".toml": "toml", ".yaml": "yaml", ".yml": "yaml", ".html": "html",
+    ".css": "css", ".sql": "sql", ".sh": "bash",
+    ".go": "go", ".rs": "rust",
 }
 
 # 文件名命中即拒绝（不看后缀）：密钥、环境变量、数据库
@@ -147,35 +160,69 @@ def _ensure_readable(path: Path) -> None:
 # ------------------------------------------------------------------ 打开 / 概览
 
 
+def build_file_filter(root: Path, settings: Settings, max_file_lines: int | None = None) -> FileFilter:
+    """按配置的语言范围构造 FileFilter。
+
+    GUI 的文件计数必须与审查时的准入规则一致，否则会出现
+    "概览说 6 个文件、审查却报了 8 个"的错位。
+    """
+    _, languages = parse_language_mode(settings.review.languages)
+    return FileFilter(
+        root,
+        excludes=list(settings.review.ignore_dirs),
+        max_file_lines=max_file_lines or settings.review.max_file_lines,
+        languages=languages,
+        extra_excludes=default_excludes_for(languages),
+    )
+
+
 def open_workspace(path: str | Path, settings: Settings, registry: WorkspaceRegistry) -> dict:
     """登记并返回工作区概览（文件数、跳过数、git 状态、可用分析器）。"""
     root = registry.register(path)
-    file_filter = FileFilter(
-        root,
-        excludes=list(settings.review.ignore_dirs),
-        max_file_lines=settings.review.max_file_lines,
-    )
-    result = scan(root, file_filter)
+    result = scan(root, build_file_filter(root, settings))
     return {
         "root": root.as_posix(),
         "root_raw": str(root),
         "name": root.name or root.drive,
         "files": len(result.files),
         "skipped": len(result.skipped),
+        "languages": result.language_counts,
         "git": git_info(root),
         "analyzer_ready": analyzer_readiness(),
     }
 
 
-def analyzer_readiness() -> dict[str, bool]:
-    from codesage.analyzers import default_analyzers
+def analyzer_readiness() -> dict[str, Any]:
+    """确定性分析器的可用性。
 
-    readiness = {"ast_rule": True}
-    for analyzer in default_analyzers():
+    返回形状刻意保持"扁平 key + 额外分组"：
+    - 扁平层（ast_rule / ruff / bandit / radon）是历史契约，前端与测试都按 key 取值，
+      改嵌套会连带破坏 3 个消费方；
+    - `by_language` 是 v2 新增的分组视图，供设置页/健康检查按语言展示。
+    """
+    from codesage.analyzers import default_analyzers, default_rule_engines
+
+    readiness: dict[str, Any] = {}
+    by_language: dict[str, dict[str, bool]] = {}
+
+    def _safe_available(target: object) -> bool:
         try:
-            readiness[analyzer.name] = bool(analyzer.is_available())
-        except Exception:  # noqa: BLE001
-            readiness[analyzer.name] = False
+            return bool(target.is_available())  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001 - 探测失败按不可用处理
+            return False
+
+    for engine in default_rule_engines():
+        available = _safe_available(engine)
+        readiness[engine.name] = available
+        by_language.setdefault(engine.language.value, {})[engine.name] = available
+
+    for analyzer in default_analyzers():
+        available = _safe_available(analyzer)
+        readiness[analyzer.name] = available
+        for language in analyzer.languages:
+            by_language.setdefault(language.value, {})[analyzer.name] = available
+
+    readiness["by_language"] = by_language
     return readiness
 
 
@@ -214,12 +261,7 @@ def scan_preview(
     if not resolved_target.exists():
         raise WorkspaceError(f"路径不存在：{target}", code="invalid_path")
     workspace = resolved_target if resolved_target.is_dir() else resolved_target.parent
-    file_filter = FileFilter(
-        workspace,
-        excludes=list(settings.review.ignore_dirs),
-        max_file_lines=settings.review.max_file_lines,
-    )
-    result = scan(resolved_target, file_filter)
+    result = scan(resolved_target, build_file_filter(workspace, settings))
     included = [
         _rel_posix(p, workspace) for p in result.files[:MAX_LISTED_FILES]
     ]
@@ -387,6 +429,9 @@ def list_tree(root: Path, relative: str = "", depth: int = 1) -> dict:
                         "name": name,
                         "type": "file",
                         "is_python": child.suffix == ".py",
+                        # v2：真正的语言标识（is_python 保留为兼容别名，
+                        # 前端 types.ts 与教学文档都在用它）
+                        "language": _language(child.suffix),
                         "size": _safe_size(child),
                     }
                 )
@@ -578,14 +623,15 @@ def _safe_size(path: Path) -> int:
 
 
 def _language(suffix: str) -> str:
-    mapping = {
-        ".py": "python", ".pyi": "python", ".ts": "typescript", ".tsx": "tsx",
-        ".js": "javascript", ".jsx": "jsx", ".json": "json", ".md": "markdown",
-        ".toml": "toml", ".yaml": "yaml", ".yml": "yaml", ".html": "html",
-        ".css": "css", ".sql": "sql", ".sh": "bash", ".java": "java",
-        ".go": "go", ".rs": "rust",
-    }
-    return mapping.get(suffix.lower(), "text")
+    """后缀 → 语言代码（供前端语法高亮）。
+
+    可审查语言（.py / .java）一律走注册表，保证"能审的语言"与"能高亮的语言"
+    是同一份数据；其余类型才查本地补充表。
+    """
+    spec = language_spec_for_path(f"x{suffix}")
+    if spec is not None:
+        return spec.code
+    return _PREVIEW_LANGUAGES.get(suffix.lower(), "text")
 
 
 def _parse_local_ts(text: str) -> float | None:
@@ -620,7 +666,7 @@ def file_line_count(path: Path) -> int:
 
 def summarize_files(root: Path, settings: Settings) -> dict[str, Any]:
     """轻量统计（供概览卡片：按后缀分布）。"""
-    result = scan(root, FileFilter(root, excludes=list(settings.review.ignore_dirs)))
+    result = scan(root, build_file_filter(root, settings))
     by_ext: dict[str, int] = {}
     for path in result.files:
         by_ext[path.suffix or "(无后缀)"] = by_ext.get(path.suffix or "(无后缀)", 0) + 1

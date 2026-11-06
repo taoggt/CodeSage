@@ -8,6 +8,7 @@ Token 控制的第一道闸门：
 
 from __future__ import annotations
 
+from codesage.core.languages import LANGUAGE_SPECS
 from codesage.core.models import Finding
 
 
@@ -17,6 +18,30 @@ def build_file_inventory(files: list[tuple[str, int]]) -> str:
         return "（无文件）"
     lines = [f"- {path} | {lines} 行" for path, lines in files]
     return "\n".join(lines)
+
+
+def describe_scope(files: list[tuple[str, int]], languages: dict[str, int] | None) -> str:
+    """描述本次审查范围，如 "Python 文件 3 个、Java 文件 2 个"。
+
+    为什么要按语言拆开计数：模型看到"3 个文件"却读到 Java 代码时，
+    容易套用 Python 的惯例给建议（例如让 Java 方法写 docstring）。
+    语言清单本身是最便宜的先验。
+    """
+    if not languages:
+        return f"Python 文件 {len(files)} 个"
+
+    ordered = [
+        (spec.display, languages[lang.value])
+        for lang, spec in LANGUAGE_SPECS.items()
+        if languages.get(lang.value)
+    ]
+    if not ordered:
+        return f"代码文件 {len(files)} 个"
+    if len(ordered) == 1:
+        display, count = ordered[0]
+        return f"{display} 文件 {count} 个"
+    detail = "、".join(f"{display} {count} 个" for display, count in ordered)
+    return f"文件 {len(files)} 个（{detail}）"
 
 
 def build_candidates_block(
@@ -53,8 +78,13 @@ def build_task_brief(
     candidates: list[Finding],
     max_candidates: int = 40,
     changed_only: bool = False,
+    languages: dict[str, int] | None = None,
 ) -> str:
-    """生成初始 user 消息（任务简报）。"""
+    """生成初始 user 消息（任务简报）。
+
+    languages 为语言 → 文件数（pipeline 的探测结果）；None 时退回 v1 的
+    "Python 文件 N 个"措辞，保证历史评测的 Prompt 不变。
+    """
     scope_note = (
         "本次为**增量审查**：只关注 git 变更涉及的文件与行区间附近的代码。"
         if changed_only
@@ -62,7 +92,7 @@ def build_task_brief(
     )
     return f"""## 审查任务
 
-目标：{target}（Python 文件 {len(files)} 个）
+目标：{target}（{describe_scope(files, languages)}）
 {scope_note}
 
 ## 文件清单（相对路径 | 行数）

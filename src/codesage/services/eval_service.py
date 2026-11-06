@@ -25,6 +25,10 @@ def default_dataset_candidates() -> list[Path]:
         Path("examples/eval_dataset"),
         Path("eval_dataset"),
         Path.cwd() / "examples" / "eval_dataset",
+        # Java 数据集单独一个目录：两种语言混在一个指标里，召回率会掩盖
+        # "某一种语言其实没跑通"的问题。
+        Path("examples/eval_dataset_java"),
+        Path.cwd() / "examples" / "eval_dataset_java",
     ]
 
 

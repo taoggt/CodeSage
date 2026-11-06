@@ -69,6 +69,7 @@ export const CATEGORY_ZH: Record<string, string> = {
 
 export const SOURCE_ZH: Record<string, string> = {
   ast_rule: "自研规则",
+  java_rule: "Java 规则",
   ruff: "Ruff",
   bandit: "Bandit",
   radon: "radon",
