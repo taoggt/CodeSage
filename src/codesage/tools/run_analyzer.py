@@ -7,7 +7,7 @@ from typing import Any, Callable
 
 from codesage.agent.registry import tool
 from codesage.core.languages import language_for_path, language_spec
-from codesage.tools.read_file import _resolve_inside
+from codesage.tools.paths import resolve_inside
 
 MAX_ITEMS = 30  # 单次返回的问题条数上限（防刷屏）
 
@@ -54,7 +54,7 @@ def make_run_analyzer_tool(
                 f"{language_spec(detected).display} 文件{hint}"
             )
 
-        target = _resolve_inside(root, path)
+        target = resolve_inside(root, path)
         if target is None or not target.is_file():
             return f"ERROR: 文件不存在或路径非法：{path}"
 

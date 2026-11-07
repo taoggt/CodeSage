@@ -18,6 +18,14 @@ timeout = 120.0
 #   context_window = 模型标称上限，只用于校验与展示
 #   budget_window  = 单次审查真正可用的额度，三区阈值以它为分母
 # 把 budget_window 设成 1M 不会让审查更准，只会让压缩永不触发、单轮成本翻倍。
+#
+# 重要：默认组合（max_turns=12 + 单次工具结果上限 6000 字符）下上下文峰值
+# 通常只有 2~5 万 token，离 soft 的 72000 差得远，压缩与熔断都**不会触发**。
+# 报告 metadata.budget_diagnostics 会给出本次峰值与原因。
+# 想真实跑通压缩链路（例如做评测/面试演示），把下面两项一起改：
+#   [review] max_turns = 24
+#   [budget] budget_window = 60000   # soft = 36000，约第 10~12 轮触发
+# 不改也没错：1M 窗口放得下，压缩省的钱在 12 轮内约等于它自己那次调用的成本。
 context_window = 1000000      # 模型标称上下文窗口（token）
 budget_window = 120000        # 工作预算（token）← 压缩与熔断按这个算
 soft_ratio = 0.6              # 预算使用率 ≥ 60%：回合边界触发压缩

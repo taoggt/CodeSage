@@ -8,7 +8,7 @@ from typing import Callable
 
 from codesage.agent.registry import tool
 from codesage.core.languages import Language, language_spec_for_path
-from codesage.tools.read_file import _resolve_inside
+from codesage.tools.paths import resolve_inside
 
 
 def _format_args(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
@@ -94,7 +94,7 @@ def make_list_symbols_tool(workspace: Path) -> Callable[..., str]:
         Args:
             path: 相对工作区路径（.py 或 .java）
         """
-        target = _resolve_inside(root, path)
+        target = resolve_inside(root, path)
         if target is None or not target.is_file():
             return f"ERROR: 文件不存在或路径非法：{path}"
         try:

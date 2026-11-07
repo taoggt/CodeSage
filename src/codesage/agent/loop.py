@@ -1,20 +1,24 @@
 """ReAct 主循环：LLM ↔ 工具 交替执行（自研内核）。
 
-循环骨架（约 150 行的核心）：
+循环骨架：
 
     while True:
         1. 估计当前上下文 token 量 → 检查预算状态（OK/SOFT/HARD/ABORT）
         2. ABORT → 熔断退出（输出已有发现）
            HARD  → 调用前强制压缩
-        3. 调用 LLM（带工具 schema）
+        3. 调用 LLM（带工具 schema）；失败重试一次，仍失败则降级收尾
         4. 无 tool_calls → 模型认为完成，正常结束
            有 tool_calls → 逐个执行并回填结果（role=tool）
         5. 回合末：轮次/进展检查；SOFT → 回合边界压缩
 
 设计要点：
-- 循环不认识"压缩细节"与"发现收集"（依赖注入）——关注点分离；
-- 工具错误不抛出，以文本回填让模型自我纠正；
+- 循环不认识「压缩细节」「发现收集」「工作区」——全部依赖注入；
+- 工具错误不抛出，以文本回填让模型自我纠正；连续错误会额外注入纠偏提示，
+  避免模型把失败结果当成事实继续推理；
 - 每一步都通过 on_event 钩子可观测（CLI 进度、调试、评测 trace）。
+
+轮次上限的**唯一真相源是 StopPolicy.max_turns**。LoopConfig 不再持有
+max_turns（旧版有但从未被读取，导致「配置说是 12、实际判停用另一份」）。
 """
 
 from __future__ import annotations
@@ -39,29 +43,34 @@ from codesage.memory.working import WorkingMemory
 
 logger = logging.getLogger(__name__)
 
-# 压缩器：接收"中间区消息列表"，返回结构化摘要文本（由外部注入 LLM 实现）
-Compressor = Callable[[list[dict[str, Any]]], str]
+# 压缩器：接收压缩 prompt，返回摘要文本（由外部注入 LLM 实现）
+Compressor = Callable[[str], str]
 # 事件钩子：(事件名, 载荷)
 EventHook = Callable[[str, dict[str, Any]], None]
+# 钉住块提供者：返回可由确定性状态重建的事实清单（已提交发现 / 已读文件）
+PinnedState = Callable[[], str]
 
 
 @dataclass
 class LoopConfig:
-    max_turns: int = 12
+    """循环的非策略性参数（轮次属于 StopPolicy，不放这里）。"""
+
     max_tool_result_chars: int = 6000
+    max_llm_retries: int = 1  # 单次 chat 失败后重试几次（SDK 另自带 2 次）
 
 
 @dataclass
 class AgentResult:
     """循环执行结果。"""
 
-    status: str = "finished"  # finished / stopped / aborted / error
+    status: str = "finished"  # finished / stopped / aborted / degraded / cancelled / error
     stop_reason: str = ""
     turns: int = 0
     final_message: str = ""
     usage: TokenUsage = field(default_factory=TokenUsage)
     tool_calls_total: int = 0
     compress_events: int = 0
+    llm_failures: int = 0
 
 
 class AgentLoop:
@@ -79,6 +88,7 @@ class AgentLoop:
         policy: StopPolicy | None = None,
         config: LoopConfig | None = None,
         compressor: Compressor | None = None,
+        pinned_state: PinnedState | None = None,
         findings_counter: Callable[[], int] | None = None,
         on_event: EventHook | None = None,
         cancel_token: CancelToken | None = None,
@@ -92,6 +102,7 @@ class AgentLoop:
         self._policy = policy or StopPolicy()
         self._config = config or LoopConfig()
         self._compressor = compressor
+        self._pinned_state = pinned_state
         self._findings_counter = findings_counter
         self._on_event = on_event
         self._cancel_token = cancel_token
@@ -110,7 +121,10 @@ class AgentLoop:
         self._memory.freeze(initial_messages)
         state = AgentState()
         result = AgentResult()
-        self._emit("start", {"tools": self._registry.names()})
+        llm_failures = 0
+        consecutive_tool_errors = 0
+        warned_about_errors = False
+        self._emit("start", {"tools": self._registry.names(), "max_turns": self._policy.max_turns})
 
         while True:
             # ---- 0. 取消检查（协作式：在每轮与每次外部调用前生效）
@@ -137,12 +151,19 @@ class AgentLoop:
             if budget_state == BudgetState.ABORT:
                 result.status = "aborted"
                 result.stop_reason = (
-                    f"Token 预算熔断（使用率 ≥ {int(self._budget_ratio_abort * 100)}%），"
+                    f"Token 预算熔断（使用率 ≥ {int(self._budget.abort_ratio * 100)}%），"
                     "输出已有发现"
                 )
                 break
             if budget_state == BudgetState.HARD:
                 self._compress(context_tokens)
+                if self._budget.state(self._estimate_context()) == BudgetState.HARD:
+                    # 压缩没能把预算降下来（常见原因：活跃区不足 K 轮，
+                    # 或撑爆的是不可压缩的冻结区）。不假装已解决，显式上报。
+                    self._emit(
+                        "compress_ineffective",
+                        {"turn": state.turn, "tokens": self._estimate_context()},
+                    )
 
             # ---- 2. LLM 调用
             if self._cancelled():
@@ -157,8 +178,20 @@ class AgentLoop:
                     model=self._model,
                 )
             except LLMError as exc:
-                result.status = "error"
-                result.stop_reason = f"LLM 调用失败：{exc}"
+                llm_failures += 1
+                self._emit(
+                    "llm_error",
+                    {"turn": state.turn, "attempt": llm_failures, "error": str(exc)},
+                )
+                if llm_failures <= self._config.max_llm_retries:
+                    # 消息序列未改动，重试是幂等的；不增加 turn。
+                    continue
+                result.status = "degraded"
+                result.stop_reason = (
+                    f"LLM 连续 {llm_failures} 次调用失败，已输出此前提交的发现"
+                    f"（降级完成）：{exc}"
+                )
+                self._emit("degraded", {"turn": state.turn, "reason": result.stop_reason})
                 break
 
             self._budget.record(response.usage)
@@ -206,6 +239,7 @@ class AgentLoop:
             )
 
             cancelled_in_tools = False
+            turn_errors = 0
             for tc in response.tool_calls:
                 if self._cancelled():
                     cancelled_in_tools = True
@@ -217,12 +251,15 @@ class AgentLoop:
                 )
                 self._memory.append(tool_result_message(tc.id, output))
                 state.tool_calls_total += 1
+                if output.startswith("ERROR"):
+                    turn_errors += 1
                 self._emit(
                     "tool_result",
                     {
                         "name": tc.name,
                         "preview": output[:120].replace("\n", " "),
                         "chars": len(output),
+                        "is_error": output.startswith("ERROR"),
                     },
                 )
 
@@ -231,6 +268,27 @@ class AgentLoop:
                 result.stop_reason = "用户取消"
                 self._emit("cancelled", {"turn": state.turn + 1, "phase": "tool_loop"})
                 break
+
+            # 连续错误纠偏：模型看到的是 ERROR 文本，但它仍可能把失败结果
+            # 当成事实继续推理。连续两轮出错时显式打断一次。
+            consecutive_tool_errors = (
+                consecutive_tool_errors + 1 if turn_errors else 0
+            )
+            if consecutive_tool_errors >= 2 and not warned_about_errors:
+                self._memory.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "注意：最近连续多轮工具调用返回 ERROR。不要基于失败结果"
+                            "继续推理或提交发现；请先用 read_file 确认路径与行号，"
+                            "再决定下一步。"
+                        ),
+                    }
+                )
+                warned_about_errors = True
+                self._emit("tool_error_streak", {"streak": consecutive_tool_errors})
+            if turn_errors == 0:
+                warned_about_errors = False
 
             # ---- 4. 回合末：进展记录 + 停止检查 + 软阈值压缩
             state.turn += 1
@@ -252,23 +310,25 @@ class AgentLoop:
         result.tool_calls_total = state.tool_calls_total
         result.usage = self._budget.usage
         result.compress_events = self._compress_count
+        result.llm_failures = llm_failures
         self._emit("end", {"status": result.status, "reason": result.stop_reason})
         return result
 
     # ------------------------------------------------------------ 内部方法
 
-    @property
-    def _budget_ratio_abort(self) -> float:
-        return self._budget.abort_ratio
-
     def _estimate_context(self) -> int:
         return self._estimator.estimate_messages(self._memory.build())
 
     def _compress(self, context_tokens: int | None = None) -> None:
-        """执行一次压缩（无压缩器注入时为空操作）。"""
+        """执行一次压缩（无压缩器注入时为空操作）。
+
+        钉住块由外部按确定性状态重建，不经过 LLM；只有「推理残留」
+        才交给压缩器，避免摘要弄丢已提交发现。
+        """
         if self._compressor is None:
             return
-        event = self._memory.compress(self._compressor)
+        pinned = self._pinned_state() if self._pinned_state is not None else ""
+        event = self._memory.compress(self._compressor, pinned=pinned)
         if event is not None:
             self._compress_count += 1
             self._emit(
@@ -276,6 +336,15 @@ class AgentLoop:
                 {
                     "removed": event.removed_messages,
                     "kept": event.kept_messages,
+                    "context_tokens": context_tokens,
+                    "pinned_chars": len(pinned),
+                },
+            )
+        elif self._memory.last_compress_reason not in ("", "no_need"):
+            self._emit(
+                "compress_skipped",
+                {
+                    "reason": self._memory.last_compress_reason,
                     "context_tokens": context_tokens,
                 },
             )

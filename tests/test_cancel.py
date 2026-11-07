@@ -116,7 +116,7 @@ def test_loop_cancel_mid_run_keeps_status() -> None:
         estimator=HeuristicEstimator(),
         model="mock",
         policy=StopPolicy(max_turns=5),
-        config=LoopConfig(max_turns=5),
+        config=LoopConfig(),
         cancel_token=token,
     )
     result = loop.run([{"role": "user", "content": "开始"}])
@@ -142,7 +142,7 @@ def test_loop_emits_assistant_message_and_tool_args() -> None:
         estimator=HeuristicEstimator(),
         model="mock",
         policy=StopPolicy(max_turns=5),
-        config=LoopConfig(max_turns=5),
+        config=LoopConfig(),
         on_event=lambda name, payload: events.append((name, payload)),
         cancel_token=token,
     )

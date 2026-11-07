@@ -6,27 +6,22 @@ from pathlib import Path
 from typing import Callable
 
 from codesage.agent.registry import tool
+from codesage.tools.paths import normalize_relative, resolve_inside
 
 
-def _resolve_inside(root: Path, path: str) -> Path | None:
-    """把相对路径解析到工作区内；越权或非法路径返回 None（防路径穿越）。"""
-    try:
-        target = (root / path).resolve()
-    except (OSError, ValueError):
-        return None
-    try:
-        if not target.is_relative_to(root):
-            return None
-    except ValueError:
-        return None
-    return target
-
-
-def make_read_file_tool(workspace: Path, limit: int = 500) -> Callable[..., str]:
+def make_read_file_tool(
+    workspace: Path,
+    limit: int = 500,
+    visit_log: list[str] | None = None,
+) -> Callable[..., str]:
     """创建 read_file 工具。
 
     limit 是单次返回的最大行数——从源头控制上下文增长，
     防止模型一次读取就把上下文撑爆。
+
+    visit_log 是可选的「已读文件台账」：成功读取时追加规范化相对路径。
+    由 pipeline 持有，用于压缩时确定性重建「已审查文件清单」与计算覆盖率。
+    工具层只负责往列表里追加，不知道台账最终被谁消费。
     """
     root = Path(workspace).resolve()
 
@@ -39,7 +34,7 @@ def make_read_file_tool(workspace: Path, limit: int = 500) -> Callable[..., str]
             start_line: 起始行号（1-based，默认从第 1 行开始）
             end_line: 结束行号（0 表示自动读取 start_line 之后的若干行）
         """
-        target = _resolve_inside(root, path)
+        target = resolve_inside(root, str(path))
         if target is None:
             return f"ERROR: 非法路径（必须是工作区内的文件）：{path}"
         if not target.is_file():
@@ -63,8 +58,12 @@ def make_read_file_tool(workspace: Path, limit: int = 500) -> Callable[..., str]
         if start > total:
             return f"ERROR: start_line={start} 超过文件总行数（{total}）"
 
+        rel = normalize_relative(target, root)
+        if visit_log is not None:
+            visit_log.append(rel)
+
         width = len(str(end))
-        out = [f"# {path}（共 {total} 行，当前显示 {start}-{end}）"]
+        out = [f"# {rel}（共 {total} 行，当前显示 {start}-{end}）"]
         for i in range(start, end + 1):
             out.append(f"{i:>{width}} | {all_lines[i - 1]}")
         if end < total:

@@ -166,9 +166,15 @@ class Finding:
         return hashlib.sha1(key.encode("utf-8"), usedforsecurity=False).hexdigest()[:8]
 
     @property
-    def dedup_key(self) -> str:
-        """去重键：同文件 + 相近行 + 同类别视为同一问题（保留高置信度者）。"""
-        return f"{self.file}:{self.line_start // 3}:{self.category.value}"
+    def location_key(self) -> str:
+        """位置键：只回答「在哪」，不回答「是不是同一个问题」。
+
+        旧版叫 dedup_key，值形如 file:line//3:category，一个键同时承担
+        「位置」与「问题身份」两种语义：换个 category 就能绕过判重，
+        而 3 行分桶又让相邻行（2 与 3）落进不同桶。现在把两个职责拆开：
+        位置判定用本属性，语义判定用模块级 same_issue()。
+        """
+        return f"{self.file}:{self.line_start}"
 
     @property
     def language_code(self) -> str:
@@ -333,44 +339,76 @@ class ReviewReport:
         return report
 
 
-def dedup_findings(findings: list[Finding]) -> list[Finding]:
-    """按 dedup_key 分组去重。
+NEAR_LINE_WINDOW = 2  # 行号差在此范围内视为「同位置」候选
 
-    去重规则（解决跨工具重复报告，同时不误伤同一工具的独立发现）：
-    - 组内只有单一来源 → 全部保留（同行上的两条自研规则发现是不同问题，
-      例如"裸 except"与"异常被吞没"）；
-    - 组内有多个来源（如 Bandit 与自研规则报了同一处问题）→ 只保留
-      优先级最高来源的条目。
+_SOURCE_PRIORITY: dict[Source, int] = {
+    Source.LLM: 0,           # 语义确认过
+    Source.AST_RULE: 1,      # 中文描述与修复建议最完整
+    Source.JAVA_RULE: 1,     # 与 Python 自研规则同级（语言互斥，不会真撞同行）
+    Source.BANDIT: 2,
+    Source.RUFF: 3,
+    Source.RADON: 4,
+}
 
-    来源优先级：LLM（语义确认过）> 自研规则（中文描述与修复建议最完整）
-    > Bandit > Ruff > radon。
 
-    Java 规则与 Python 自研规则同级（都是 1）——它们不会同时出现在同一个
-    文件的同一行上（语言互斥），排同一档只是为了让未来"跨语言同构检查"
-    的出现顺序可预测。
+def normalize_issue_title(title: str) -> str:
+    """标题归一化：去所有空白 + 小写，用于判断两条发现是不是同一问题。"""
+    return "".join(str(title).lower().split())
+
+
+def same_issue(a: Finding, b: Finding) -> bool:
+    """判断两条发现是不是同一个问题的重复表述（submit_finding 层用）。
+
+    判据刻意**不含 category**：模型把同一处 SQL 拼接一会儿报 bug、
+    一会儿报 security 是高频摇摆，旧键里带 category 会让这种重复直接漏过。
+    反过来，标题不同的两条（"裸 except" / "异常被吞没"）即使同位置、
+    同类别也应并报——静默删掉那是漏报，比重复更贵。
     """
-    source_priority = {
-        Source.LLM: 0,
-        Source.AST_RULE: 1,
-        Source.JAVA_RULE: 1,
-        Source.BANDIT: 2,
-        Source.RUFF: 3,
-        Source.RADON: 4,
-    }
+    if a.file != b.file:
+        return False
+    if a.line_start > b.line_end + NEAR_LINE_WINDOW:
+        return False
+    if b.line_start > a.line_end + NEAR_LINE_WINDOW:
+        return False
+    title_a = normalize_issue_title(a.title)
+    return bool(title_a) and title_a == normalize_issue_title(b.title)
 
-    groups: dict[str, list[Finding]] = {}
+
+def _resolve_cluster(cluster: list[Finding]) -> list[Finding]:
+    """一簇内的跨来源合并：单一来源全保留，多来源只留优先级最高者。"""
+    if len(cluster) <= 1:
+        return list(cluster)
+    sources = {f.source for f in cluster}
+    if len(sources) == 1:
+        return list(cluster)  # 同来源同位置的独立发现，全部保留
+    best = min(sources, key=lambda s: _SOURCE_PRIORITY.get(s, 9))
+    return [f for f in cluster if f.source == best]
+
+
+def dedup_findings(findings: list[Finding]) -> list[Finding]:
+    """按「文件 + 类别」分组，组内用行号邻接聚类做跨来源合并。
+
+    与旧实现的两点区别：
+    - 去掉 `line // 3` 硬分桶：第 2 行与第 3 行紧挨着却落进不同桶的
+      边界缺陷没了；行号差 ≤ NEAR_LINE_WINDOW 都能聚到一簇。
+    - 报告层保留 category 作为分组维度：同位置不同类别可能是两个独立
+      视角（项目既有设计，测试已锁定）。「同一问题换类别重复提交」由
+      submit_finding 层按标题语义拦截，报告层不越权删除。
+    """
+    buckets: dict[tuple[str, str], list[Finding]] = {}
     for f in findings:
-        groups.setdefault(f.dedup_key, []).append(f)
+        buckets.setdefault((f.file, f.category.value), []).append(f)
 
     result: list[Finding] = []
-    for group in groups.values():
-        if len(group) == 1:
-            result.extend(group)
-            continue
-        sources = {f.source for f in group}
-        if len(sources) == 1:
-            result.extend(group)  # 单一来源：均为独立发现，全部保留
-            continue
-        best_source = min(sources, key=lambda s: source_priority.get(s, 9))
-        result.extend(f for f in group if f.source == best_source)
+    for items in buckets.values():
+        items.sort(key=lambda f: (f.line_start, f.line_end, f.rule_id))
+        cluster: list[Finding] = []
+        for f in items:
+            # 以簇首为锚，避免 10/12/14 链式漂移成一大簇
+            if cluster and f.line_start - cluster[0].line_start > NEAR_LINE_WINDOW:
+                result.extend(_resolve_cluster(cluster))
+                cluster = []
+            cluster.append(f)
+        if cluster:
+            result.extend(_resolve_cluster(cluster))
     return result

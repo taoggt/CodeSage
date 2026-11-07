@@ -41,6 +41,8 @@ def build_default_tools(
     findings_collector: list[Finding],
     dismissed_collector: list[dict] | None = None,
     read_limit: int = 500,
+    visit_log: list[str] | None = None,
+    candidates: list[Finding] | None = None,
 ) -> ToolRegistry:
     """组装默认工具集。
 
@@ -50,9 +52,11 @@ def build_default_tools(
     - knowledge_base: 知识库实例（可为 None，则不注册该工具）
     - findings_collector: LLM 发现的收集列表（submit_finding 写入目标）
     - dismissed_collector: 被驳回候选的记录列表（dismiss_candidate 写入目标）
+    - visit_log: 已读文件台账（read_file 写入，压缩/覆盖率统计读取）
+    - candidates: 确定性候选发现清单（dismiss_candidate 校验驳回目标是否存在）
     """
     registry = ToolRegistry()
-    registry.register(make_read_file_tool(workspace, limit=read_limit))
+    registry.register(make_read_file_tool(workspace, limit=read_limit, visit_log=visit_log))
     registry.register(make_search_code_tool(workspace))
     registry.register(make_list_symbols_tool(workspace))
     if analyzers:
@@ -61,5 +65,11 @@ def build_default_tools(
         registry.register(make_query_knowledge_tool(knowledge_base))
     registry.register(make_submit_finding_tool(findings_collector, workspace))
     if dismissed_collector is not None:
-        registry.register(make_dismiss_candidate_tool(dismissed_collector))
+        registry.register(
+            make_dismiss_candidate_tool(
+                dismissed_collector,
+                workspace=workspace,
+                candidates=candidates,
+            )
+        )
     return registry

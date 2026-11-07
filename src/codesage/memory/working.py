@@ -1,15 +1,14 @@
-"""三区工作记忆 + 双阈值压缩（对齐工业界已验证的设计）。
+"""三区工作记忆 + 双阈值压缩。
 
 三区模型：
     ┌────────────────────────────────────────────┐
     │ 冻结区 frozen：系统提示 + 任务简报            │  永不压缩
-    │ （跨轮次完全不变 → 可命中 prompt 缓存）        │
     ├────────────────────────────────────────────┤
-    │ 压缩区 summary：中间轮次的结构化摘要           │  由 LLM 压缩产生
-    │ （保留：已提交发现 / 审查进度 / 未决疑点）      │
+    │ 压缩区：钉住块（系统记录） + LLM 摘要          │
+    │   钉住块 = 已提交发现 / 已读文件，代码重建     │  绝不交给 LLM
+    │   摘要   = 推理残留（假设、未决疑点）          │  由 LLM 压缩
     ├────────────────────────────────────────────┤
     │ 活跃区 active：最近 K 轮原文                  │  保持原样
-    │ （保证推理连续性）                            │
     └────────────────────────────────────────────┘
 
 双阈值触发（由 AgentLoop 驱动，本模块只负责执行压缩）：
@@ -17,8 +16,14 @@
     ≥80%（hard）：调用前强制压缩 —— 保证下一轮放得下
     ≥95%（abort）：熔断（在 loop 中处理）
 
-压缩质量控制：压缩器必须保留"所有已提交发现"，压缩 prompt 中有
-明确约束；压缩失败（返回空）时不改动状态（宁可占 token，不可丢信息）。
+压缩质量控制（2026-11 审计后重写）：
+- 「已提交发现」「已读文件」这类**能从确定性状态重建的事实**，压根不交给
+  LLM 摘要，而是由调用方生成 pinned 文本原样钉在压缩区。旧版只在 prompt
+  里写一句「严禁遗漏已提交的发现」，但 _serialize 连 tool_calls 的
+  arguments 都没序列化——压缩器根本没见过 finding 正文，要求它保留是空的。
+- 压缩器输出过短/过长都视为失败（长过原文 80% 的摘要反而让上下文变胖），
+  失败时保持原状：宁可多占 token，不可丢信息。
+- 每次压缩结果都有 last_compress_reason，供 loop 上报「压缩为何没生效」。
 """
 
 from __future__ import annotations
@@ -36,16 +41,18 @@ class CompressEvent:
     removed_messages: int
     kept_messages: int
     summary_chars: int
+    pinned_chars: int = 0
 
 
 COMPRESS_PROMPT = """你是代码审查过程的信息压缩器。把下面的审查过程压缩为结构化摘要。
 
 压缩要求（严格执行）：
-1. 必须完整保留：所有已提交的发现（编号 + 文件:行号 + 一句话结论）、
-   已审查的文件清单、未决疑点与待办。
+1. 保留「推理残留」：为什么读了某个文件、当前待验证的假设、
+   未决疑点与下一步计划。
 2. 丢弃：重复的文件内容、冗长的工具原始输出、已完成的分析细节。
-3. 输出为简洁的要点列表（纯文本），不要任何寒暄或说明。
-4. 严禁遗漏“已提交的发现”——它们是最终报告的核心数据。
+3. **不要罗列已提交发现 / 已读文件清单**——它们由系统按权威记录
+   单独钉住，你重复写一遍只会让摘要变长。
+4. 输出为简洁的要点列表（纯文本），不要任何寒暄或说明。
 
 {previous}## 审查过程原文
 
@@ -60,8 +67,10 @@ class WorkingMemory:
     active_window_turns: int = 4
     _frozen: list[dict[str, Any]] = field(default_factory=list, repr=False)
     _active: list[dict[str, Any]] = field(default_factory=list, repr=False)
-    _summary: str = ""
+    _summary: str = ""          # LLM 产出的推理残留
+    _pinned: str = ""           # 系统确定性重建的事实清单
     _events: list[CompressEvent] = field(default_factory=list, repr=False)
+    _last_reason: str = ""
 
     # ------------------------------------------------------------ 基础操作
 
@@ -73,18 +82,17 @@ class WorkingMemory:
         self._active.append(message)
 
     def build(self) -> list[dict[str, Any]]:
-        """组装完整消息序列：冻结区 + 摘要 + 活跃区。"""
+        """组装完整消息序列：冻结区 + 压缩区（钉住块 + 摘要）+ 活跃区。"""
         out: list[dict[str, Any]] = list(self._frozen)
-        if self._summary:
-            out.append(
-                {
-                    "role": "system",
-                    "content": (
-                        "## 历史审查过程摘要（此前轮次已压缩，发现均已记录）\n"
-                        f"{self._summary}"
-                    ),
-                }
-            )
+        if self._pinned or self._summary:
+            parts = ["## 历史审查过程摘要（此前轮次已压缩）"]
+            if self._pinned:
+                parts.append(
+                    "### 系统记录（确定性重建，权威，不可覆盖）\n" + self._pinned
+                )
+            if self._summary:
+                parts.append("### 推理残留（LLM 摘要）\n" + self._summary)
+            out.append({"role": "system", "content": "\n\n".join(parts)})
         out.extend(self._active)
         return out
 
@@ -92,7 +100,12 @@ class WorkingMemory:
 
     @property
     def summary(self) -> str:
+        """LLM 摘要部分（不含钉住块）。"""
         return self._summary
+
+    @property
+    def pinned(self) -> str:
+        return self._pinned
 
     @property
     def events(self) -> list[CompressEvent]:
@@ -100,31 +113,41 @@ class WorkingMemory:
 
     @property
     def compressed(self) -> bool:
-        return bool(self._summary)
+        return bool(self._pinned or self._summary)
 
     @property
     def active_count(self) -> int:
         return len(self._active)
 
+    @property
+    def last_compress_reason(self) -> str:
+        """最近一次 compress() 未生效的原因；成功或尚未调用为空串。"""
+        return self._last_reason
+
     # ------------------------------------------------------------ 压缩
 
-    def compress(self, compressor: Compressor) -> CompressEvent | None:
+    def compress(self, compressor: Compressor, pinned: str = "") -> CompressEvent | None:
         """压缩中间区（活跃区中除最近 K 轮外的部分）。
 
-        返回 None 表示：无需压缩（轮数不足）或压缩失败（保持原状）。
+        pinned 是外部按确定性状态重建的事实清单：它不参与 LLM 压缩，
+        每次压缩时被最新值覆盖，因此永远不会「被摘要弄丢」。
+        返回 None 表示无需压缩或压缩失败（状态保持原状）。
         """
+        self._last_reason = ""
         keep_from = self._find_keep_index()
         if keep_from <= 0:
-            return None  # 活跃区不足 K 轮，不压缩
+            self._last_reason = "no_need"  # 活跃区不足 K 轮
+            return None
 
         middle = self._active[:keep_from]
         payload = self._serialize(middle)
         if not payload.strip():
+            self._last_reason = "empty_payload"
             return None
 
         prompt = COMPRESS_PROMPT.format(
             previous=(
-                f"## 已有摘要（与本次新内容合并，不可丢失其中信息）\n{self._summary}\n\n"
+                f"## 已有推理摘要（与本次新内容合并，不可丢失其中信息）\n{self._summary}\n\n"
                 if self._summary
                 else ""
             ),
@@ -134,16 +157,27 @@ class WorkingMemory:
         try:
             new_summary = compressor(prompt)
         except Exception:  # noqa: BLE001 - 压缩失败保持原状（信息优先于成本）
+            self._last_reason = "compressor_error"
             return None
 
         if not new_summary or not new_summary.strip():
+            self._last_reason = "empty_summary"
+            return None
+
+        # 摘要比原文还长（或几乎一样长）时，压缩只会让上下文变胖。
+        # 短 payload 给 200 字符的绝对容差，避免把「a0/t0」这种测试素材误判。
+        limit = max(200, int(len(payload) * 0.8))
+        if len(new_summary.strip()) > limit:
+            self._last_reason = "bloated_summary"
             return None
 
         event = CompressEvent(
             removed_messages=len(middle),
             kept_messages=len(self._active) - keep_from,
-            summary_chars=len(new_summary),
+            summary_chars=len(new_summary.strip()),
+            pinned_chars=len(pinned),
         )
+        self._pinned = pinned.strip()
         self._summary = new_summary.strip()
         self._active = self._active[keep_from:]
         self._events.append(event)
@@ -170,19 +204,31 @@ class WorkingMemory:
 
     @staticmethod
     def _serialize(messages: list[dict[str, Any]]) -> str:
-        """把中间区消息序列化为压缩器输入（控制单条长度，防止二次膨胀）。"""
+        """把中间区消息序列化为压缩器输入（控制单条长度，防止二次膨胀）。
+
+        assistant 的 tool_calls **必须带上 arguments 摘要**：旧版只写工具名，
+        submit_finding 的标题、描述、修复建议全都没进压缩输入，压缩器
+        不可能保住它没见过的信息。现在每条调用的参数截到 400 字符，
+        整条 assistant 截到 800 字符，既保留推理轨迹又不撑爆 prompt。
+        """
         parts: list[str] = []
         for msg in messages:
             role = msg.get("role", "?")
             content = msg.get("content") or ""
             if role == "assistant":
-                tool_calls = msg.get("tool_calls") or []
-                names = [
-                    (tc.get("function") or {}).get("name", "?")
-                    for tc in tool_calls
-                    if isinstance(tc, dict)
-                ]
-                head = f"[assistant] 调用工具：{', '.join(names)}" if names else "[assistant]"
+                calls: list[str] = []
+                for tc in msg.get("tool_calls") or []:
+                    if not isinstance(tc, dict):
+                        continue
+                    fn = tc.get("function") or {}
+                    name = str(fn.get("name", "?"))
+                    args = str(fn.get("arguments") or "")[:400].replace("\n", " ")
+                    calls.append(f"{name}({args})" if args else name)
+                head = (
+                    "[assistant] 调用工具：" + "; ".join(calls)[:800]
+                    if calls
+                    else "[assistant]"
+                )
                 parts.append(f"{head}\n{str(content)[:600]}")
             elif role == "tool":
                 parts.append(f"[tool 结果] {str(content)[:900]}")

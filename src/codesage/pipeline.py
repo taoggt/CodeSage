@@ -269,6 +269,17 @@ def run_review(
     compress_events = 0
     llm_used = False
     cancelled_reason: str | None = None
+    llm_failures = 0
+    llm_degraded = False
+
+    # 轮次上限的唯一真相源：任务简报、StopPolicy、诊断都读同一个值。
+    # 旧版简报硬编码 settings.review.max_turns，--max-turns 3 时模型仍被
+    # 告知「最多 12 轮」，而 LoopConfig.max_turns 又是个从未被读取的死字段。
+    effective_turns = options.max_turns or settings.review.max_turns
+
+    # 已读文件台账（read_file 写入）：压缩钉住块与覆盖率统计的数据源
+    visit_log: list[str] = []
+    context_peak: dict[str, float] = {"tokens": 0.0, "ratio": 0.0}
 
     store = _open_store(settings.review.store_path)
     try:
@@ -290,7 +301,40 @@ def run_review(
                 findings_collector=llm_findings,
                 dismissed_collector=dismissed,
                 read_limit=settings.review.tool_output_limit,
+                visit_log=visit_log,
+                candidates=det_findings,
             )
+
+            def pinned_state() -> str:
+                """压缩钉住块：只放能从确定性状态重建的事实，不交给 LLM。
+
+                已提交发现在 llm_findings 里、已读文件在 visit_log 里，
+                每次压缩都用最新状态覆盖，摘要弄丢它们已无从谈起。
+                """
+                lines = [f"### 已提交发现（共 {len(llm_findings)} 条）"]
+                if llm_findings:
+                    for idx, f in enumerate(llm_findings, 1):
+                        lines.append(
+                            f"{idx}. {f.file}:{f.line_start}-{f.line_end} "
+                            f"[{f.category.value}/{f.severity.value}] {f.title}"
+                        )
+                else:
+                    lines.append("（暂无）")
+                read = sorted(set(visit_log))
+                lines.append(f"### 已读文件（共 {len(read)} 个）")
+                lines.extend(f"- {p}" for p in read[:200])
+                return "\n".join(lines)
+
+            def loop_event(event: str, payload: dict[str, Any]) -> None:
+                """转发事件的同时记录上下文峰值，供预算可达性诊断。"""
+                if event == "context":
+                    context_peak["tokens"] = max(
+                        context_peak["tokens"], float(payload.get("tokens", 0))
+                    )
+                    context_peak["ratio"] = max(
+                        context_peak["ratio"], float(payload.get("ratio", 0.0))
+                    )
+                _emit(options, event, payload)
 
             lessons_block = ""
             if store is not None:
@@ -308,7 +352,8 @@ def run_review(
                 workspace_summary=build_workspace_summary(workspace, files),
                 lessons_block=lessons_block,
                 budget_hint=(
-                    f"最多可执行 {settings.review.max_turns} 轮工具调用，请合理分配。"
+                    f"最多可执行 {effective_turns} 个回合"
+                    "（每回合可发起多个工具调用），请合理分配。"
                 ),
                 languages=list(grouped),
             )
@@ -329,15 +374,12 @@ def run_review(
                 budget=budget,
                 estimator=estimator,
                 model=router.model_for(TaskKind.REVIEW),
-                policy=StopPolicy(
-                    max_turns=options.max_turns or settings.review.max_turns
-                ),
-                config=LoopConfig(
-                    max_turns=options.max_turns or settings.review.max_turns,
-                ),
+                policy=StopPolicy(max_turns=effective_turns),
+                config=LoopConfig(),
                 compressor=compressor,
+                pinned_state=pinned_state,
                 findings_counter=lambda: len(llm_findings),
-                on_event=options.on_event,
+                on_event=loop_event,
                 cancel_token=token,
             )
 
@@ -351,6 +393,8 @@ def run_review(
             turns = result.turns
             stop_reason = result.stop_reason
             compress_events = result.compress_events
+            llm_failures = result.llm_failures
+            llm_degraded = result.status == "degraded"
             if result.status == "cancelled":
                 cancelled_reason = "llm"
 
@@ -362,6 +406,29 @@ def run_review(
         merged = _merge_findings(det_findings, llm_findings, dismissed)
         duration = time.perf_counter() - started
 
+        # 预算可达性诊断：让「压缩没触发」从沉默变成一条可观测数据。
+        # 默认 12 轮 + 6000 字符工具结果上限下上下文峰值通常只有 soft 的
+        # 两三成，压缩/熔断在默认配置里根本不会触发；不写进报告，用户和
+        # 面试追问都无从判断这套机制到底跑没跑过。
+        soft_tokens = int(
+            settings.budget.effective_budget_window * settings.budget.soft_ratio
+        )
+        diagnostics: dict[str, Any] = {
+            "peak_context_tokens": int(context_peak["tokens"]),
+            "peak_ratio": round(context_peak["ratio"], 3),
+            "soft_threshold_tokens": soft_tokens,
+            "compress_events": compress_events,
+            "compression_triggered": compress_events > 0,
+            "max_turns": effective_turns,
+        }
+        if llm_used and compress_events == 0:
+            diagnostics["note"] = (
+                f"本次上下文峰值 {int(context_peak['tokens'])} token，"
+                f"未达到 soft 阈值 {soft_tokens} token，压缩未触发。"
+                "如需验证压缩链路：调大 review.max_turns（≥24）"
+                "并调小 budget.budget_window（≈60000）。"
+            )
+
         metadata: dict[str, Any] = {
             "profile": options.profile,
             "cost_yuan": 0.0,
@@ -369,6 +436,17 @@ def run_review(
             "llm_findings": len(llm_findings),
             "dismissed": dismissed,
             "analyzers": [a.name for a in analyzers],
+            # ---- 循环可观测性（审计后新增）
+            "max_turns": effective_turns,
+            "llm_failures": llm_failures,
+            "llm_degraded": llm_degraded,
+            "files_read": sorted(set(visit_log)),
+            "coverage_ratio": (
+                round(len(set(visit_log)) / len(file_inventory), 3)
+                if file_inventory
+                else 0.0
+            ),
+            "budget_diagnostics": diagnostics,
             # ---- 多语言（只增字段，老 GUI 忽略即可）
             "language_mode": language_mode,
             "languages": detected_languages,

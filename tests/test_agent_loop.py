@@ -66,7 +66,7 @@ def build_loop(
         estimator=HeuristicEstimator(),
         model="mock",
         policy=StopPolicy(max_turns=max_turns, no_progress_patience=2),
-        config=LoopConfig(max_turns=max_turns),
+        config=LoopConfig(),
         findings_counter=findings_counter,
         compressor=compressor,
     )
@@ -255,7 +255,9 @@ def test_soft_threshold_triggers_compression():
     result = loop.run(base_messages(system_content="x" * 3000))
     assert result.compress_events >= 1
     assert compressed_prompts  # 压缩器被调用
-    assert "已提交的发现" in compressed_prompts[0]  # 压缩 prompt 含防丢失约束
+    # 新契约：权威事实由钉住块确定性重建，压缩 prompt 明确不接管它们
+    assert "已提交发现" in compressed_prompts[0]
+    assert "已读文件清单" in compressed_prompts[0]
     assert result.status in ("finished", "stopped")
 
 
